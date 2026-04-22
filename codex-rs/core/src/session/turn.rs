@@ -1069,6 +1069,10 @@ async fn run_sampling_request(
             turn_context.as_ref(),
             base_instructions.clone(),
         );
+        let agent_task_auth = sess
+            .thread_agent_task_auth_for_provider(turn_context.provider.info())
+            .await?;
+        client_session.set_agent_task_auth(agent_task_auth);
         let err = match try_run_sampling_request(
             tool_runtime.clone(),
             Arc::clone(&sess),

@@ -225,6 +225,10 @@ async fn schedule_startup_prewarm_inner(
         .turn_metadata_state
         .current_header_value();
     let mut client_session = session.services.model_client.new_session();
+    let agent_task_auth = session
+        .thread_agent_task_auth_for_provider(startup_turn_context.provider.info())
+        .await?;
+    client_session.set_agent_task_auth(agent_task_auth);
     client_session
         .prewarm_websocket(
             &startup_prompt,

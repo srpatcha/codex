@@ -832,8 +832,6 @@ impl Session {
                 ));
             }
         }
-        sess.schedule_startup_prewarm(session_configuration.base_instructions.clone())
-            .await;
         let session_start_source = match &initial_history {
             InitialHistory::Resumed(_) => codex_hooks::SessionStartSource::Resume,
             InitialHistory::New | InitialHistory::Forked(_) => {
@@ -844,6 +842,8 @@ impl Session {
 
         // record_initial_history can emit events. We record only after the SessionConfiguredEvent is emitted.
         sess.record_initial_history(initial_history).await;
+        sess.schedule_startup_prewarm(session_configuration.base_instructions.clone())
+            .await;
         {
             let mut state = sess.state.lock().await;
             state.set_pending_session_start_source(Some(session_start_source));

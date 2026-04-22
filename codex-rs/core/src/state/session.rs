@@ -114,6 +114,10 @@ impl SessionState {
         self.history.reference_context_item()
     }
 
+    pub(crate) fn agent_task(&self) -> Option<SessionAgentTask> {
+        self.agent_task.clone()
+    }
+
     pub(crate) fn set_agent_task(&mut self, agent_task: SessionAgentTask) {
         self.agent_task = Some(agent_task);
     }

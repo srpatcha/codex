@@ -2328,6 +2328,7 @@ dependencies = [
  "bm25",
  "chrono",
  "clap",
+ "codex-agent-identity",
  "codex-analytics",
  "codex-api",
  "codex-app-server-protocol",

@@ -45,18 +45,20 @@ impl AgentIdentityAuth {
 
     pub async fn ensure_runtime(&self, chatgpt_base_url: Option<String>) -> std::io::Result<()> {
         self.process_task_id
-            .get_or_try_init(|| async {
-                let base_url = normalize_chatgpt_base_url(
-                    chatgpt_base_url
-                        .as_deref()
-                        .unwrap_or(DEFAULT_CHATGPT_BACKEND_BASE_URL),
-                );
-                register_agent_task(&build_reqwest_client(), &base_url, self.key())
-                    .await
-                    .map_err(std::io::Error::other)
-            })
+            .get_or_try_init(|| async { self.register_task(chatgpt_base_url).await })
             .await
             .map(|_| ())
+    }
+
+    pub async fn register_task(&self, chatgpt_base_url: Option<String>) -> std::io::Result<String> {
+        let base_url = normalize_chatgpt_base_url(
+            chatgpt_base_url
+                .as_deref()
+                .unwrap_or(DEFAULT_CHATGPT_BACKEND_BASE_URL),
+        );
+        register_agent_task(&build_reqwest_client(), &base_url, self.key())
+            .await
+            .map_err(std::io::Error::other)
     }
 
     pub fn account_id(&self) -> &str {

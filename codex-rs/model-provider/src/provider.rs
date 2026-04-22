@@ -9,6 +9,7 @@ use codex_model_provider_info::ModelProviderAwsAuthInfo;
 use codex_model_provider_info::ModelProviderInfo;
 
 use crate::amazon_bedrock::AmazonBedrockModelProvider;
+use crate::auth::AgentTaskAuth;
 use crate::auth::auth_manager_for_provider;
 use crate::auth::resolve_provider_auth;
 
@@ -42,8 +43,17 @@ pub trait ModelProvider: fmt::Debug + Send + Sync {
 
     /// Returns the auth provider used to attach request credentials.
     async fn api_auth(&self) -> codex_protocol::error::Result<SharedAuthProvider> {
+        self.api_auth_with_agent_task(/*agent_task_auth*/ None)
+            .await
+    }
+
+    /// Returns request credentials, optionally using a task-scoped Agent Identity assertion.
+    async fn api_auth_with_agent_task(
+        &self,
+        agent_task_auth: Option<AgentTaskAuth>,
+    ) -> codex_protocol::error::Result<SharedAuthProvider> {
         let auth = self.auth().await;
-        resolve_provider_auth(auth.as_ref(), self.info())
+        resolve_provider_auth(auth.as_ref(), self.info(), agent_task_auth)
     }
 }
 

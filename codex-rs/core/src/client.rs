@@ -109,6 +109,7 @@ use codex_feedback::FeedbackRequestTags;
 use codex_feedback::emit_feedback_request_tags_with_auth_env;
 use codex_login::auth_env_telemetry::AuthEnvTelemetry;
 use codex_login::auth_env_telemetry::collect_auth_env_telemetry;
+use codex_model_provider::AgentTaskAuth;
 use codex_model_provider::SharedModelProvider;
 use codex_model_provider::create_model_provider;
 #[cfg(test)]
@@ -213,6 +214,7 @@ pub struct ModelClient {
 pub struct ModelClientSession {
     client: ModelClient,
     websocket_session: WebsocketSession,
+    agent_task_auth: Option<AgentTaskAuth>,
     /// Turn state for sticky routing.
     ///
     /// This is an `OnceLock` that stores the turn state value received from the server
@@ -333,6 +335,7 @@ impl ModelClient {
         ModelClientSession {
             client: self.clone(),
             websocket_session: self.take_cached_websocket_session(),
+            agent_task_auth: None,
             turn_state: Arc::new(OnceLock::new()),
         }
     }
@@ -669,9 +672,21 @@ impl ModelClient {
     /// This centralizes setup used by both prewarm and normal request paths so they stay in
     /// lockstep when auth/provider resolution changes.
     async fn current_client_setup(&self) -> Result<CurrentClientSetup> {
+        self.current_client_setup_with_agent_task(/*agent_task_auth*/ None)
+            .await
+    }
+
+    async fn current_client_setup_with_agent_task(
+        &self,
+        agent_task_auth: Option<AgentTaskAuth>,
+    ) -> Result<CurrentClientSetup> {
         let auth = self.state.provider.auth().await;
         let api_provider = self.state.provider.api_provider().await?;
-        let api_auth = self.state.provider.api_auth().await?;
+        let api_auth = self
+            .state
+            .provider
+            .api_auth_with_agent_task(agent_task_auth)
+            .await?;
         Ok(CurrentClientSetup {
             auth,
             api_provider,
@@ -811,6 +826,16 @@ impl Drop for ModelClientSession {
 }
 
 impl ModelClientSession {
+    pub fn set_agent_task_auth(&mut self, agent_task_auth: Option<AgentTaskAuth>) {
+        self.agent_task_auth = agent_task_auth;
+    }
+
+    async fn current_client_setup(&self) -> Result<CurrentClientSetup> {
+        self.client
+            .current_client_setup_with_agent_task(self.agent_task_auth.clone())
+            .await
+    }
+
     pub(crate) fn reset_websocket_session(&mut self) {
         self.websocket_session.connection = None;
         self.websocket_session.last_request = None;
@@ -1016,7 +1041,7 @@ impl ModelClientSession {
             return Ok(());
         }
 
-        let client_setup = self.client.current_client_setup().await.map_err(|err| {
+        let client_setup = self.current_client_setup().await.map_err(|err| {
             ApiError::Stream(format!(
                 "failed to build websocket prewarm client setup: {err}"
             ))
@@ -1174,7 +1199,7 @@ impl ModelClientSession {
             .map(AuthManager::unauthorized_recovery);
         let mut pending_retry = PendingUnauthorizedRetry::default();
         loop {
-            let client_setup = self.client.current_client_setup().await?;
+            let client_setup = self.current_client_setup().await?;
             let transport = ReqwestTransport::new(build_reqwest_client());
             let request_auth_context = AuthRequestTelemetryContext::new(
                 client_setup.auth.as_ref().map(CodexAuth::auth_mode),
@@ -1263,7 +1288,7 @@ impl ModelClientSession {
             .map(AuthManager::unauthorized_recovery);
         let mut pending_retry = PendingUnauthorizedRetry::default();
         loop {
-            let client_setup = self.client.current_client_setup().await?;
+            let client_setup = self.current_client_setup().await?;
             let request_auth_context = AuthRequestTelemetryContext::new(
                 client_setup.auth.as_ref().map(CodexAuth::auth_mode),
                 client_setup.api_auth.as_ref(),
