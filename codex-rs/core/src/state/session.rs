@@ -11,6 +11,7 @@ use crate::session::PreviousTurnSettings;
 use crate::session::session::SessionConfiguration;
 use crate::session_startup_prewarm::SessionStartupPrewarmHandle;
 use codex_protocol::protocol::RateLimitSnapshot;
+use codex_protocol::protocol::SessionAgentTask;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
 use codex_protocol::protocol::TurnContextItem;
@@ -32,6 +33,7 @@ pub(crate) struct SessionState {
     pub(crate) startup_prewarm: Option<SessionStartupPrewarmHandle>,
     pub(crate) active_connector_selection: HashSet<String>,
     pub(crate) pending_session_start_source: Option<codex_hooks::SessionStartSource>,
+    agent_task: Option<SessionAgentTask>,
     granted_permissions: Option<PermissionProfile>,
     next_turn_is_first: bool,
 }
@@ -51,6 +53,7 @@ impl SessionState {
             startup_prewarm: None,
             active_connector_selection: HashSet::new(),
             pending_session_start_source: None,
+            agent_task: None,
             granted_permissions: None,
             next_turn_is_first: true,
         }
@@ -109,6 +112,14 @@ impl SessionState {
 
     pub(crate) fn reference_context_item(&self) -> Option<TurnContextItem> {
         self.history.reference_context_item()
+    }
+
+    pub(crate) fn set_agent_task(&mut self, agent_task: SessionAgentTask) {
+        self.agent_task = Some(agent_task);
+    }
+
+    pub(crate) fn clear_agent_task(&mut self) {
+        self.agent_task = None;
     }
 
     // Token/rate limit helpers

@@ -171,6 +171,7 @@ use codex_protocol::error::Result as CodexResult;
 #[cfg(test)]
 use codex_protocol::exec_output::StreamOutput;
 
+mod agent_task_lifecycle;
 mod handlers;
 mod mcp;
 mod review;
@@ -1127,6 +1128,7 @@ impl Session {
                 let previous_turn_settings = self
                     .apply_rollout_reconstruction(&turn_context, &rollout_items)
                     .await;
+                self.restore_persisted_agent_task(&rollout_items).await;
 
                 // If resuming, warn when the last recorded model differs from the current one.
                 let curr: &str = turn_context.model_info.slug.as_str();

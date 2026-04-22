@@ -2858,10 +2858,32 @@ pub struct SessionMetaLine {
     pub git: Option<GitInfo>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum SessionAgentTaskKind {
+    Thread,
+    Background,
+}
+
+/// Persisted agent-task details that let a resumed thread keep using the same backend task.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
+pub struct SessionAgentTask {
+    pub agent_runtime_id: String,
+    pub task_id: String,
+    pub kind: SessionAgentTaskKind,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
+pub struct SessionStateUpdate {
+    pub agent_task: Option<SessionAgentTask>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, JsonSchema, TS)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum RolloutItem {
     SessionMeta(SessionMetaLine),
+    SessionState(SessionStateUpdate),
     ResponseItem(ResponseItem),
     Compacted(CompactedItem),
     TurnContext(TurnContextItem),

@@ -701,6 +701,9 @@ impl RolloutRecorder {
                         }
                         items.push(RolloutItem::SessionMeta(session_meta_line));
                     }
+                    RolloutItem::SessionState(item) => {
+                        items.push(RolloutItem::SessionState(item));
+                    }
                     RolloutItem::ResponseItem(item) => {
                         items.push(RolloutItem::ResponseItem(item));
                     }
@@ -1565,6 +1568,7 @@ async fn resume_candidate_matches_cwd(
             RolloutItem::SessionMeta(_)
             | RolloutItem::ResponseItem(_)
             | RolloutItem::Compacted(_)
+            | RolloutItem::SessionState(_)
             | RolloutItem::EventMsg(_) => None,
         })
     {
