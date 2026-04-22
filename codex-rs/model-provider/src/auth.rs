@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use codex_agent_identity::AgentIdentityKey;
+use codex_agent_identity::AgentRuntimeId;
 use codex_agent_identity::AgentTaskAuthorizationTarget;
+use codex_agent_identity::AgentTaskId;
+use codex_agent_identity::AgentTaskKind;
 use codex_agent_identity::RegisteredAgentTask;
 use codex_agent_identity::authorization_header_for_agent_task;
 use codex_agent_identity::authorization_header_for_registered_task;
@@ -182,11 +185,45 @@ pub fn auth_provider_from_agent_task(
     })
 }
 
+/// Builds background/control-plane auth from the concrete auth snapshot.
+///
+/// ChatGPT callers that have opted into Agent Identity should first resolve the
+/// effective [`AgentIdentityAuth`] and call
+/// [`background_auth_provider_from_agent_identity_auth`].
+pub async fn background_auth_provider_from_auth(
+    auth: &CodexAuth,
+    chatgpt_base_url: Option<String>,
+) -> std::io::Result<SharedAuthProvider> {
+    match auth {
+        CodexAuth::AgentIdentity(auth) => {
+            background_auth_provider_from_agent_identity_auth(auth.clone(), chatgpt_base_url).await
+        }
+        CodexAuth::ApiKey(_) | CodexAuth::Chatgpt(_) | CodexAuth::ChatgptAuthTokens(_) => {
+            Ok(auth_provider_from_auth(auth))
+        }
+    }
+}
+
+pub async fn background_auth_provider_from_agent_identity_auth(
+    auth: AgentIdentityAuth,
+    chatgpt_base_url: Option<String>,
+) -> std::io::Result<SharedAuthProvider> {
+    auth.ensure_background_task(chatgpt_base_url).await?;
+    let task_id = auth.background_task_id().ok_or_else(|| {
+        std::io::Error::other("agent identity background task is not initialized")
+    })?;
+    Ok(auth_provider_from_agent_task(
+        auth.clone(),
+        RegisteredAgentTask::new(
+            AgentRuntimeId::new(auth.record().agent_runtime_id.clone()),
+            AgentTaskId::new(task_id.to_string()),
+            AgentTaskKind::Background,
+        ),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
-    use codex_agent_identity::AgentRuntimeId;
-    use codex_agent_identity::AgentTaskId;
-    use codex_agent_identity::AgentTaskKind;
     use codex_agent_identity::generate_agent_key_material;
     use codex_login::auth::AgentIdentityAuthRecord;
     use codex_model_provider_info::WireApi;
@@ -210,7 +247,7 @@ mod tests {
     #[test]
     fn agent_task_auth_provider_preserves_account_routing_headers() {
         let key_material = generate_agent_key_material().expect("generate key material");
-        let auth = AgentIdentityAuth::new(AgentIdentityAuthRecord {
+        let auth = codex_login::auth::AgentIdentityAuth::new(AgentIdentityAuthRecord {
             agent_runtime_id: "agent-runtime-1".to_string(),
             agent_private_key: key_material.private_key_pkcs8_base64,
             account_id: "account-1".to_string(),
