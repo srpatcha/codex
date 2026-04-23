@@ -37,6 +37,7 @@ unsafe extern "C" {
         key_tag: *const c_char,
         key_class: c_int,
     ) -> MacBytesResult;
+    fn codex_device_key_macos_delete(key_tag: *const c_char, key_class: c_int) -> MacBytesResult;
     fn codex_device_key_macos_sign(
         key_tag: *const c_char,
         key_class: c_int,
@@ -117,6 +118,16 @@ impl DeviceKeyProvider for MacOsDeviceKeyProvider {
                     })
             }
         }
+    }
+
+    fn delete(
+        &self,
+        key_id: &str,
+        protection_class: DeviceKeyProtectionClass,
+    ) -> Result<(), DeviceKeyError> {
+        let class = MacKeyClass::from_protection_class(protection_class)
+            .ok_or(DeviceKeyError::KeyNotFound)?;
+        delete_key(key_id, class)
     }
 
     fn get_public(
@@ -202,6 +213,13 @@ fn create_or_load_public_key(key_id: &str, class: MacKeyClass) -> Result<Vec<u8>
 fn load_public_key(key_id: &str, class: MacKeyClass) -> Result<Vec<u8>, DeviceKeyError> {
     let tag = key_tag_cstring(key_id, class)?;
     unsafe { codex_device_key_macos_load_public_key(tag.as_ptr(), class.native()) }.into_bytes()
+}
+
+fn delete_key(key_id: &str, class: MacKeyClass) -> Result<(), DeviceKeyError> {
+    let tag = key_tag_cstring(key_id, class)?;
+    unsafe { codex_device_key_macos_delete(tag.as_ptr(), class.native()) }
+        .into_bytes()
+        .map(|_| ())
 }
 
 fn sign(key_id: &str, class: MacKeyClass, payload: &[u8]) -> Result<Vec<u8>, DeviceKeyError> {

@@ -33,6 +33,9 @@ CodexDeviceKeyMacBytesResult codex_device_key_macos_create_or_load_public_key(
 CodexDeviceKeyMacBytesResult codex_device_key_macos_load_public_key(
     const char *key_tag,
     int32_t key_class);
+CodexDeviceKeyMacBytesResult codex_device_key_macos_delete(
+    const char *key_tag,
+    int32_t key_class);
 CodexDeviceKeyMacBytesResult codex_device_key_macos_sign(
     const char *key_tag,
     int32_t key_class,

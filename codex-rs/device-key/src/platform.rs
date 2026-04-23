@@ -35,6 +35,14 @@ mod unsupported {
             Err(DeviceKeyError::HardwareBackedKeysUnavailable)
         }
 
+        fn delete(
+            &self,
+            _key_id: &str,
+            _protection_class: DeviceKeyProtectionClass,
+        ) -> Result<(), DeviceKeyError> {
+            Ok(())
+        }
+
         fn get_public(
             &self,
             _key_id: &str,

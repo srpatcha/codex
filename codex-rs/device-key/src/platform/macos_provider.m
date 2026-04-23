@@ -303,6 +303,30 @@ CodexDeviceKeyMacBytesResult codex_device_key_macos_load_public_key(
     }
 }
 
+CodexDeviceKeyMacBytesResult codex_device_key_macos_delete(
+    const char *keyTag,
+    int32_t keyClass) {
+    @autoreleasepool {
+        if (keyTag == NULL || !CodexDeviceKeyMacClassIsValid(keyClass)) {
+            return CodexDeviceKeyMacError(
+                CodexDeviceKeyMacStatusPlatformError,
+                @"invalid macOS device-key provider argument");
+        }
+
+        NSString *tag = [NSString stringWithUTF8String:keyTag];
+        NSMutableDictionary *query = CodexDeviceKeyMacPrivateKeyQuery(tag, keyClass, nil);
+        [query removeObjectForKey:(__bridge id)kSecReturnRef];
+        OSStatus status = SecItemDelete((__bridge CFDictionaryRef)query);
+        if (status == errSecSuccess || status == errSecItemNotFound) {
+            return CodexDeviceKeyMacResultMake(CodexDeviceKeyMacStatusOk, nil, nil);
+        }
+
+        return CodexDeviceKeyMacError(
+            CodexDeviceKeyMacStatusPlatformError,
+            CodexDeviceKeyMacCopySecurityError(status));
+    }
+}
+
 CodexDeviceKeyMacBytesResult codex_device_key_macos_sign(
     const char *keyTag,
     int32_t keyClass,

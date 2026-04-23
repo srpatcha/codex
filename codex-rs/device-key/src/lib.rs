@@ -237,10 +237,26 @@ impl DeviceKeyStore {
             })
         })
         .await?;
-        self.bindings
+        match self
+            .bindings
             .put_binding(&info.key_id, &request.binding)
-            .await?;
-        Ok(info)
+            .await
+        {
+            Ok(()) => Ok(info),
+            Err(store_error) => {
+                let provider = Arc::clone(&self.provider);
+                let key_id = info.key_id;
+                let protection_class = info.protection_class;
+                if let Err(delete_error) =
+                    spawn_provider_call(move || provider.delete(&key_id, protection_class)).await
+                {
+                    return Err(DeviceKeyError::Platform(format!(
+                        "failed to store device key binding ({store_error}); failed to delete newly created key ({delete_error})"
+                    )));
+                }
+                Err(store_error)
+            }
+        }
     }
 
     pub async fn get_public(
@@ -362,6 +378,16 @@ impl ProviderCreateRequest {
 /// crate validates and serializes accepted structured payloads before calling `sign`.
 trait DeviceKeyProvider: Debug + Send + Sync {
     fn create(&self, request: ProviderCreateRequest) -> Result<DeviceKeyInfo, DeviceKeyError>;
+    /// Deletes provider-owned key material after a create operation cannot be completed.
+    ///
+    /// Implementations should treat missing keys as success where the platform allows it, since
+    /// cleanup can race with external deletion and should not mask the original persistence error
+    /// unless deletion itself fails unexpectedly.
+    fn delete(
+        &self,
+        key_id: &str,
+        protection_class: DeviceKeyProtectionClass,
+    ) -> Result<(), DeviceKeyError>;
     fn get_public(
         &self,
         key_id: &str,
@@ -711,6 +737,10 @@ mod tests {
                 keys: Mutex::new(HashMap::new()),
             }
         }
+
+        fn key_count(&self) -> usize {
+            self.keys.lock().expect("memory provider lock").len()
+        }
     }
 
     impl DeviceKeyProvider for MemoryProvider {
@@ -729,6 +759,21 @@ mod tests {
                 .entry(key_id.clone())
                 .or_insert_with(|| SigningKey::random(&mut OsRng));
             memory_key_info(&key_id, signing_key, self.class)
+        }
+
+        fn delete(
+            &self,
+            key_id: &str,
+            protection_class: DeviceKeyProtectionClass,
+        ) -> Result<(), DeviceKeyError> {
+            if protection_class != self.class {
+                return Ok(());
+            }
+            self.keys
+                .lock()
+                .map_err(|err| DeviceKeyError::Platform(err.to_string()))?
+                .remove(key_id);
+            Ok(())
         }
 
         fn get_public(
@@ -766,6 +811,27 @@ mod tests {
                 signature_der: signature.to_der().as_bytes().to_vec(),
                 algorithm: DeviceKeyAlgorithm::EcdsaP256Sha256,
             })
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailingBindingStore;
+
+    #[async_trait]
+    impl DeviceKeyBindingStore for FailingBindingStore {
+        async fn get_binding(
+            &self,
+            _key_id: &str,
+        ) -> Result<Option<DeviceKeyBinding>, DeviceKeyError> {
+            Ok(None)
+        }
+
+        async fn put_binding(
+            &self,
+            _key_id: &str,
+            _binding: &DeviceKeyBinding,
+        ) -> Result<(), DeviceKeyError> {
+            Err(DeviceKeyError::Platform("binding write failed".to_string()))
         }
     }
 
@@ -911,6 +977,27 @@ mod tests {
         assert_ne!(second.key_id, first.key_id);
         assert_valid_generated_key_id(&first.key_id, DeviceKeyProtectionClass::HardwareTpm);
         assert_valid_generated_key_id(&second.key_id, DeviceKeyProtectionClass::HardwareTpm);
+    }
+
+    #[test]
+    fn create_deletes_provider_key_when_binding_write_fails() {
+        let provider = Arc::new(MemoryProvider::new(DeviceKeyProtectionClass::HardwareTpm));
+        let store = DeviceKeyStore {
+            provider: provider.clone(),
+            bindings: Arc::new(FailingBindingStore),
+        };
+
+        let err = block_on(store.create(create_request(DeviceKeyProtectionPolicy::HardwareOnly)))
+            .expect_err("binding failure should fail create");
+
+        assert!(
+            matches!(
+                &err,
+                DeviceKeyError::Platform(message) if message == "binding write failed"
+            ),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(provider.key_count(), 0);
     }
 
     #[test]
