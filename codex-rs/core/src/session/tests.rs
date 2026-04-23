@@ -2418,10 +2418,7 @@ async fn turn_context_with_model_updates_model_fields() {
     let (session, mut turn_context) = make_session_and_context().await;
     turn_context.reasoning_effort = Some(ReasoningEffortConfig::Minimal);
     let updated = turn_context
-        .with_model(
-            "gpt-5.4".to_string(),
-            session.services.models_manager.as_ref(),
-        )
+        .with_model("gpt-5.4".to_string(), &session.services.models_manager)
         .await;
     let expected_model_info = session
         .services
@@ -3196,7 +3193,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         services.main_execve_wrapper_exe.as_ref(),
         per_turn_config,
         model_info,
-        models_manager.as_ref(),
+        &models_manager,
         /*network*/ None,
         Some(environment),
         /*environments*/ None,
@@ -4435,7 +4432,7 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
         services.main_execve_wrapper_exe.as_ref(),
         per_turn_config,
         model_info,
-        models_manager.as_ref(),
+        &models_manager,
         /*network*/ None,
         Some(environment),
         /*environments*/ None,
@@ -4580,7 +4577,7 @@ async fn build_settings_update_items_emits_environment_item_for_network_changes(
     let mut current_context = previous_context
         .with_model(
             previous_context.model_info.slug.clone(),
-            session.services.models_manager.as_ref(),
+            &session.services.models_manager,
         )
         .await;
 
@@ -4642,7 +4639,7 @@ async fn build_settings_update_items_emits_environment_item_for_time_changes() {
     let mut current_context = previous_context
         .with_model(
             previous_context.model_info.slug.clone(),
-            session.services.models_manager.as_ref(),
+            &session.services.models_manager,
         )
         .await;
     current_context.current_date = Some("2026-02-27".to_string());
@@ -4668,7 +4665,7 @@ async fn build_settings_update_items_omits_environment_item_when_disabled() {
     let mut current_context = previous_context
         .with_model(
             previous_context.model_info.slug.clone(),
-            session.services.models_manager.as_ref(),
+            &session.services.models_manager,
         )
         .await;
     let mut config = (*current_context.config).clone();
@@ -4697,7 +4694,7 @@ async fn build_settings_update_items_emits_realtime_start_when_session_becomes_l
     let mut current_context = previous_context
         .with_model(
             previous_context.model_info.slug.clone(),
-            session.services.models_manager.as_ref(),
+            &session.services.models_manager,
         )
         .await;
     current_context.realtime_active = true;
@@ -4725,7 +4722,7 @@ async fn build_settings_update_items_emits_realtime_end_when_session_stops_being
     let mut current_context = previous_context
         .with_model(
             previous_context.model_info.slug.clone(),
-            session.services.models_manager.as_ref(),
+            &session.services.models_manager,
         )
         .await;
     current_context.realtime_active = false;
@@ -4758,7 +4755,7 @@ async fn build_settings_update_items_uses_previous_turn_settings_for_realtime_en
     let mut current_context = previous_context
         .with_model(
             previous_context.model_info.slug.clone(),
-            session.services.models_manager.as_ref(),
+            &session.services.models_manager,
         )
         .await;
     current_context.realtime_active = false;
@@ -5289,10 +5286,7 @@ async fn record_context_updates_and_set_reference_context_item_persists_baseline
         "gpt-5.4"
     };
     let turn_context = previous_context
-        .with_model(
-            next_model.to_string(),
-            session.services.models_manager.as_ref(),
-        )
+        .with_model(next_model.to_string(), &session.services.models_manager)
         .await;
     let previous_context_item = previous_context.to_turn_context_item();
     {
@@ -5444,10 +5438,7 @@ async fn record_context_updates_and_set_reference_context_item_persists_full_rei
         "gpt-5.4"
     };
     let turn_context = previous_context
-        .with_model(
-            next_model.to_string(),
-            session.services.models_manager.as_ref(),
-        )
+        .with_model(next_model.to_string(), &session.services.models_manager)
         .await;
     let config = session.get_config().await;
     let recorder = RolloutRecorder::new(
