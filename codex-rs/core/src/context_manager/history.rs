@@ -111,6 +111,14 @@ impl ContextManager {
             let processed = self.process_item(item_ref, policy);
             self.items.push(processed);
         }
+
+        // Safety cap: prevent unbounded growth if auto-compaction fails.
+        // Keep the most recent items when the hard limit is exceeded.
+        const MAX_HISTORY_ITEMS: usize = 10_000;
+        if self.items.len() > MAX_HISTORY_ITEMS {
+            let drain_count = self.items.len() - MAX_HISTORY_ITEMS;
+            self.items.drain(..drain_count);
+        }
     }
 
     /// Returns the history prepared for sending to the model. This applies a proper
