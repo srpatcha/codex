@@ -161,7 +161,6 @@ pub(super) async fn make_chatwidget_manual(
     let model_catalog = test_model_catalog(&cfg);
     let common = ChatWidgetInit {
         config: cfg,
-        environment_manager: Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
         frame_requester: FrameRequester::test_dummy(),
         app_event_tx,
         workspace_command_runner: None,
@@ -1314,6 +1313,8 @@ pub(super) fn plugins_test_summary(
 ) -> PluginSummary {
     PluginSummary {
         id: id.to_string(),
+        remote_plugin_id: None,
+        local_version: None,
         name: name.to_string(),
         share_context: None,
         source: PluginSource::Local {
@@ -1570,6 +1571,7 @@ fn hook_event_label(event_name: codex_app_server_protocol::HookEventName) -> &'s
         codex_app_server_protocol::HookEventName::PostCompact => "PostCompact",
         codex_app_server_protocol::HookEventName::SessionStart => "SessionStart",
         codex_app_server_protocol::HookEventName::UserPromptSubmit => "UserPromptSubmit",
+        codex_app_server_protocol::HookEventName::SubagentStart => "SubagentStart",
         codex_app_server_protocol::HookEventName::Stop => "Stop",
     }
 }

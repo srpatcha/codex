@@ -62,6 +62,12 @@
     },
     "ConfigRequirements": {
       "properties": {
+        "allowManagedHooksOnly": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "allowedApprovalPolicies": {
           "items": {
             "$ref": "#/definitions/AskForApproval"
@@ -120,6 +126,12 @@
             },
             "command": {
               "type": "string"
+            },
+            "commandWindows": {
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "statusMessage": {
               "type": [
@@ -249,6 +261,12 @@
           },
           "type": "array"
         },
+        "SubagentStart": {
+          "items": {
+            "$ref": "#/definitions/ConfiguredHookMatcherGroup"
+          },
+          "type": "array"
+        },
         "UserPromptSubmit": {
           "items": {
             "$ref": "#/definitions/ConfiguredHookMatcherGroup"
@@ -276,6 +294,7 @@
         "PreToolUse",
         "SessionStart",
         "Stop",
+        "SubagentStart",
         "UserPromptSubmit"
       ],
       "type": "object"
