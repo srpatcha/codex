@@ -2426,6 +2426,7 @@ impl Config {
             permission_profile: mut constrained_permission_profile,
             web_search_mode: mut constrained_web_search_mode,
             allow_managed_hooks_only: _,
+            computer_use: _,
             feature_requirements,
             managed_hooks: _,
             mcp_servers,
@@ -2437,14 +2438,17 @@ impl Config {
             guardian_policy_config_source: _,
         } = config_layer_stack.requirements().clone();
 
-        let user_instructions =
-            AgentsMdManager::load_global_instructions(LOCAL_FS.as_ref(), Some(&codex_home))
-                .await
-                .map(|loaded| loaded.contents);
         let mut startup_warnings = config_layer_stack
             .startup_warnings()
             .unwrap_or_default()
             .to_vec();
+        let user_instructions = AgentsMdManager::load_global_instructions(
+            LOCAL_FS.as_ref(),
+            Some(&codex_home),
+            &mut startup_warnings,
+        )
+        .await
+        .map(|loaded| loaded.contents);
 
         // Destructure ConfigOverrides fully to ensure all overrides are applied.
         let ConfigOverrides {
