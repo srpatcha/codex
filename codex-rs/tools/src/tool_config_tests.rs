@@ -22,6 +22,7 @@ fn model_with_shell_type(shell_type: ConfigShellToolType) -> ModelInfo {
         priority: 0,
         additional_speed_tiers: Vec::new(),
         service_tiers: Vec::new(),
+        default_service_tier: None,
         availability_nux: None,
         upgrade: None,
         base_instructions: String::new(),
@@ -43,6 +44,7 @@ fn model_with_shell_type(shell_type: ConfigShellToolType) -> ModelInfo {
         input_modalities: codex_protocol::openai_models::default_input_modalities(),
         used_fallback_model_metadata: false,
         supports_search_tool: false,
+        tool_mode: None,
     }
 }
 
