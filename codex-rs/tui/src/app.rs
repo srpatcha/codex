@@ -16,6 +16,7 @@ use crate::app_event::RealtimeAudioDeviceKind;
 #[cfg(target_os = "windows")]
 use crate::app_event::WindowsSandboxEnableMode;
 use crate::app_event_sender::AppEventSender;
+use crate::app_server_session::AppServerBootstrap;
 use crate::app_server_session::AppServerSession;
 use crate::app_server_session::AppServerStartedThread;
 use crate::app_server_session::TurnPermissionsOverride;
@@ -129,6 +130,7 @@ use codex_app_server_protocol::Turn;
 use codex_app_server_protocol::TurnError as AppServerTurnError;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::WriteStatus;
+use codex_config::CloudConfigBundleLoader;
 use codex_config::ConfigLayerStackOrdering;
 use codex_config::LoaderOverrides;
 use codex_config::types::ApprovalsReviewer;
@@ -489,6 +491,7 @@ pub(crate) struct App {
     cli_kv_overrides: Vec<(String, TomlValue)>,
     harness_overrides: ConfigOverrides,
     loader_overrides: LoaderOverrides,
+    cloud_config_bundle: CloudConfigBundleLoader,
     runtime_approval_policy_override: Option<AskForApproval>,
     runtime_permission_profile_override: Option<RuntimePermissionProfileOverride>,
 
@@ -512,10 +515,12 @@ pub(crate) struct App {
     status_line_invalid_items_warned: Arc<AtomicBool>,
     // Shared across ChatWidget instances so invalid terminal-title config warnings only emit once.
     terminal_title_invalid_items_warned: Arc<AtomicBool>,
+    // Tracks active skill-load warnings so refreshes do not duplicate history cells.
+    skill_load_warnings: SkillLoadWarningState,
 
     // Esc-backtracking state grouped
     pub(crate) backtrack: crate::app_backtrack::BacktrackState,
-    /// When set, the next draw re-renders the transcript into terminal scrollback once.
+    /// When set, the next draw rebuilds terminal scrollback from the retained transcript cells.
     ///
     /// This is used after a confirmed thread rollback to ensure scrollback reflects the trimmed
     /// transcript cells.
@@ -717,6 +722,7 @@ impl App {
         cli_kv_overrides: Vec<(String, TomlValue)>,
         harness_overrides: ConfigOverrides,
         loader_overrides: LoaderOverrides,
+        cloud_config_bundle: CloudConfigBundleLoader,
         initial_prompt: Option<String>,
         initial_images: Vec<PathBuf>,
         session_selection: SessionSelection,
@@ -727,6 +733,8 @@ impl App {
         app_server_target: AppServerTarget,
         state_db: Option<StateDbHandle>,
         environment_manager: Arc<EnvironmentManager>,
+        startup_elapsed_before_app: Duration,
+        startup_bootstrap: Option<AppServerBootstrap>,
         startup_hooks_browser: Option<HooksListEntry>,
     ) -> Result<AppExitInfo> {
         use tokio_stream::StreamExt;
@@ -749,6 +757,7 @@ impl App {
                 &mut config,
                 &cli_kv_overrides,
                 &harness_overrides,
+                &cloud_config_bundle,
                 entered_trust_nux,
             )
             .await?;
@@ -774,9 +783,11 @@ impl App {
                 });
             }
         };
-        let bootstrap_started_at = Instant::now();
-        let bootstrap = app_server.bootstrap(&config).await?;
-        let bootstrap_ms = bootstrap_started_at.elapsed().as_millis();
+        let bootstrap = match startup_bootstrap {
+            Some(bootstrap) => bootstrap,
+            None => app_server.bootstrap(&config).await?,
+        };
+        let bootstrap_ms = bootstrap.duration.as_millis();
         let mut model = bootstrap.default_model;
         let available_models = bootstrap.available_models;
         let remote_connection = crate::status::remote_connection::remote_connection_status_value(
@@ -996,6 +1007,7 @@ See the Codex keymap documentation for supported actions and examples."
             cli_kv_overrides,
             harness_overrides,
             loader_overrides,
+            cloud_config_bundle,
             runtime_approval_policy_override: None,
             runtime_permission_profile_override: None,
             file_search,
@@ -1010,6 +1022,7 @@ See the Codex keymap documentation for supported actions and examples."
             commit_anim_running: Arc::new(AtomicBool::new(false)),
             status_line_invalid_items_warned: status_line_invalid_items_warned.clone(),
             terminal_title_invalid_items_warned: terminal_title_invalid_items_warned.clone(),
+            skill_load_warnings: SkillLoadWarningState::default(),
             backtrack: BacktrackState::default(),
             backtrack_render_pending: false,
             feedback: feedback.clone(),
@@ -1085,7 +1098,7 @@ See the Codex keymap documentation for supported actions and examples."
 
         tui.frame_requester().schedule_frame();
         tracing::info!(
-            duration_ms = %startup_started_at.elapsed().as_millis(),
+            duration_ms = %(startup_elapsed_before_app + startup_started_at.elapsed()).as_millis(),
             bootstrap_ms = %bootstrap_ms,
             runtime_model_provider_ms = %runtime_model_provider_ms,
             thread_and_widget_ms = %thread_and_widget_ms,
@@ -1105,16 +1118,15 @@ See the Codex keymap documentation for supported actions and examples."
 
         #[cfg(not(debug_assertions))]
         let pre_loop_exit_reason = if let Some(latest_version) = upgrade_version {
-            let control = app
-                .handle_event(
-                    tui,
-                    &mut app_server,
-                    AppEvent::InsertHistoryCell(Box::new(UpdateAvailableHistoryCell::new(
-                        latest_version,
-                        crate::update_action::get_update_action(),
-                    ))),
-                )
-                .await?;
+            let control = Box::pin(app.handle_event(
+                tui,
+                &mut app_server,
+                AppEvent::InsertHistoryCell(Box::new(UpdateAvailableHistoryCell::new(
+                    latest_version,
+                    crate::update_action::get_update_action(),
+                ))),
+            ))
+            .await?;
             match control {
                 AppRunControl::Continue => None,
                 AppRunControl::Exit(exit_reason) => Some(exit_reason),
@@ -1131,7 +1143,7 @@ See the Codex keymap documentation for supported actions and examples."
             loop {
                 let control = select! {
                     Some(event) = app_event_rx.recv() => {
-                        match app.handle_event(tui, &mut app_server, event).await {
+                        match Box::pin(app.handle_event(tui, &mut app_server, event)).await {
                             Ok(control) => control,
                             Err(err) => break Err(err),
                         }
@@ -1257,8 +1269,8 @@ See the Codex keymap documentation for supported actions and examples."
                 }
                 TuiEvent::Draw | TuiEvent::Resize => {
                     if self.backtrack_render_pending {
+                        self.rebuild_transcript_after_backtrack(tui)?;
                         self.backtrack_render_pending = false;
-                        self.render_transcript_once(tui);
                     }
                     self.chat_widget.maybe_post_pending_notification(tui);
                     if self
