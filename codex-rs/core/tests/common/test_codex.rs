@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -24,7 +25,10 @@ use codex_exec_server::CreateDirectoryOptions;
 use codex_exec_server::ExecutorFileSystem;
 use codex_exec_server::RemoveOptions;
 use codex_extension_api::ExtensionRegistry;
+use codex_extension_api::LoadUserInstructionsFuture;
+use codex_extension_api::UserInstructionsProvider;
 use codex_extension_api::empty_extension_registry;
+use codex_home::CodexHomeUserInstructionsProvider;
 use codex_login::CodexAuth;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::built_in_model_providers;
@@ -43,12 +47,12 @@ use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::protocol::TurnEnvironmentSelections;
 use codex_protocol::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::PathUri;
 use futures::future::BoxFuture;
 use serde_json::Value;
 use tempfile::TempDir;
 use wiremock::MockServer;
 
-use crate::PathBufExt;
 use crate::TempDirExt;
 use crate::get_remote_test_env;
 use crate::load_default_config_for_test;
@@ -71,10 +75,35 @@ const REMOTE_EXEC_SERVER_URL_ENV_VAR: &str = "CODEX_TEST_REMOTE_EXEC_SERVER_URL"
 static REMOTE_TEST_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 const SUBMIT_TURN_COMPLETE_TIMEOUT: Duration = Duration::from_secs(30);
 
+pub struct RecordingUserInstructionsProvider {
+    inner: Arc<dyn UserInstructionsProvider>,
+    load_count: AtomicUsize,
+}
+
+impl RecordingUserInstructionsProvider {
+    pub fn new(inner: Arc<dyn UserInstructionsProvider>) -> Self {
+        Self {
+            inner,
+            load_count: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn load_count(&self) -> usize {
+        self.load_count.load(Ordering::SeqCst)
+    }
+}
+
+impl UserInstructionsProvider for RecordingUserInstructionsProvider {
+    fn load_user_instructions(&self) -> LoadUserInstructionsFuture<'_> {
+        self.load_count.fetch_add(1, Ordering::SeqCst);
+        self.inner.load_user_instructions()
+    }
+}
+
 pub fn local(cwd: AbsolutePathBuf) -> TurnEnvironmentSelection {
     TurnEnvironmentSelection {
         environment_id: codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
-        cwd,
+        cwd: PathUri::from_abs_path(&cwd),
     }
 }
 
@@ -134,33 +163,29 @@ pub async fn test_env() -> Result<TestEnv> {
             let websocket_url = remote_exec_server_url()?;
             let environment =
                 codex_exec_server::Environment::create_for_tests(Some(websocket_url.clone()))?;
-            let cwd = remote_aware_cwd_path();
+            let cwd = remote_env
+                .remote_cwd(&remote_test_instance_id())?
+                .context("remote test environment should define a cwd")?;
+            let cwd_uri = cwd.to_path_uri(remote_env.path_convention())?;
             environment
                 .get_filesystem()
                 .create_directory(
-                    &cwd,
+                    &cwd_uri,
                     CreateDirectoryOptions { recursive: true },
                     /*sandbox*/ None,
                 )
                 .await?;
+            let cwd = cwd_uri.to_abs_path()?;
             Ok(TestEnv {
                 environment,
                 exec_server_url: Some(websocket_url),
                 cwd,
                 local_cwd_temp_dir: None,
-                remote_container_name: Some(remote_env.container_name),
+                remote_container_name: remote_env.docker_container_name().map(str::to_owned),
             })
         }
         None => TestEnv::local().await,
     }
-}
-
-fn remote_aware_cwd_path() -> AbsolutePathBuf {
-    PathBuf::from(format!(
-        "/tmp/codex-core-test-cwd-{}",
-        remote_test_instance_id()
-    ))
-    .abs()
 }
 
 fn remote_exec_server_url() -> Result<String> {
@@ -231,6 +256,7 @@ pub struct TestCodexBuilder {
     user_shell_override: Option<Shell>,
     exec_server_url: Option<String>,
     extensions: Arc<ExtensionRegistry<Config>>,
+    user_instructions_provider: Option<Arc<dyn UserInstructionsProvider>>,
 }
 
 impl TestCodexBuilder {
@@ -317,6 +343,14 @@ impl TestCodexBuilder {
 
     pub fn with_extensions(mut self, extensions: Arc<ExtensionRegistry<Config>>) -> Self {
         self.extensions = extensions;
+        self
+    }
+
+    pub fn with_user_instructions_provider(
+        mut self,
+        provider: Arc<dyn UserInstructionsProvider>,
+    ) -> Self {
+        self.user_instructions_provider = Some(provider);
         self
     }
 
@@ -508,12 +542,19 @@ impl TestCodexBuilder {
         let state_db = codex_core::init_state_db(&config).await;
         let thread_store = thread_store_from_config(&config, state_db.clone());
         let installation_id = resolve_installation_id(&config.codex_home).await?;
+        let user_instructions_provider =
+            self.user_instructions_provider.clone().unwrap_or_else(|| {
+                Arc::new(CodexHomeUserInstructionsProvider::new(
+                    config.codex_home.clone(),
+                ))
+            });
         let thread_manager = ThreadManager::new(
             &config,
             codex_core::test_support::auth_manager_from_auth(auth.clone()),
             SessionSource::Exec,
             Arc::clone(&environment_manager),
             Arc::clone(&self.extensions),
+            user_instructions_provider,
             /*analytics_events_client*/ None,
             thread_store,
             state_db.clone(),
@@ -907,35 +948,45 @@ impl TestCodexHarness {
     ) -> Result<()> {
         let abs_path = self.path_abs(rel);
         if let Some(parent) = abs_path.parent() {
+            let parent_uri = PathUri::from_path(&parent)?;
             self.test
                 .fs()
                 .create_directory(
-                    &parent,
+                    &parent_uri,
                     CreateDirectoryOptions { recursive: true },
                     /*sandbox*/ None,
                 )
                 .await?;
         }
+        let abs_path_uri = PathUri::from_path(&abs_path)?;
         self.test
             .fs()
-            .write_file(&abs_path, contents.as_ref().to_vec(), /*sandbox*/ None)
+            .write_file(
+                &abs_path_uri,
+                contents.as_ref().to_vec(),
+                /*sandbox*/ None,
+            )
             .await?;
         Ok(())
     }
 
     pub async fn read_file_text(&self, rel: impl AsRef<Path>) -> Result<String> {
+        let path = self.path_abs(rel);
+        let path_uri = PathUri::from_path(&path)?;
         Ok(self
             .test
             .fs()
-            .read_file_text(&self.path_abs(rel), /*sandbox*/ None)
+            .read_file_text(&path_uri, /*sandbox*/ None)
             .await?)
     }
 
     pub async fn create_dir_all(&self, rel: impl AsRef<Path>) -> Result<()> {
+        let path = self.path_abs(rel);
+        let path_uri = PathUri::from_path(&path)?;
         self.test
             .fs()
             .create_directory(
-                &self.path_abs(rel),
+                &path_uri,
                 CreateDirectoryOptions { recursive: true },
                 /*sandbox*/ None,
             )
@@ -948,10 +999,11 @@ impl TestCodexHarness {
     }
 
     pub async fn remove_abs_path(&self, path: &AbsolutePathBuf) -> Result<()> {
+        let path_uri = PathUri::from_abs_path(path);
         self.test
             .fs()
             .remove(
-                path,
+                &path_uri,
                 RemoveOptions {
                     recursive: false,
                     force: true,
@@ -963,7 +1015,13 @@ impl TestCodexHarness {
     }
 
     pub async fn abs_path_exists(&self, path: &AbsolutePathBuf) -> Result<bool> {
-        match self.test.fs().get_metadata(path, /*sandbox*/ None).await {
+        let path_uri = PathUri::from_abs_path(path);
+        match self
+            .test
+            .fs()
+            .get_metadata(&path_uri, /*sandbox*/ None)
+            .await
+        {
             Ok(_) => Ok(true),
             Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
             Err(err) => Err(err.into()),
@@ -1084,6 +1142,7 @@ pub fn test_codex() -> TestCodexBuilder {
         user_shell_override: None,
         exec_server_url: None,
         extensions: empty_extension_registry(),
+        user_instructions_provider: None,
     }
 }
 
