@@ -68,12 +68,11 @@ struct ParsedUnifiedExecOutput {
     output: String,
 }
 
-#[allow(clippy::expect_used)]
 fn parse_unified_exec_output(raw: &str) -> Result<ParsedUnifiedExecOutput> {
     static OUTPUT_REGEX: OnceLock<Regex> = OnceLock::new();
     let regex = OUTPUT_REGEX.get_or_init(|| {
         Regex::new(concat!(
-            r#"(?s)^(?:Total output lines: \d+\n\n)?"#,
+            r#"(?s)^(?:Warning: truncated output \(original token count: \d+\)\n)?(?:Total output lines: \d+\n\n)?"#,
             r#"(?:Chunk ID: (?P<chunk_id>[^\n]+)\n)?"#,
             r#"Wall time: (?P<wall_time>-?\d+(?:\.\d+)?) seconds\n"#,
             r#"(?:Process exited with code (?P<exit_code>-?\d+)\n)?"#,
@@ -249,9 +248,10 @@ async fn unified_exec_intercepts_apply_patch_exec_command() -> Result<()> {
 
     let builder = test_codex().with_config(|config| {
         config.use_experimental_unified_exec_tool = true;
-        if let Err(err) = config.features.enable(Feature::UnifiedExec) {
-            panic!("test config should allow feature update: {err}");
-        }
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
     });
     let harness = TestCodexHarness::with_builder(builder).await?;
 
@@ -521,7 +521,6 @@ async fn unified_exec_resolves_relative_workdir() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "flaky"]
 async fn unified_exec_respects_workdir_override() -> Result<()> {
     skip_if_no_network!(Ok(()));
     skip_if_sandbox!(Ok(()));
@@ -908,7 +907,6 @@ async fn unified_exec_short_lived_network_denial_emits_failed_end_event() -> Res
     Ok(())
 }
 
-#[allow(clippy::expect_used)]
 async fn unified_exec_network_denial_test(
     server: &wiremock::MockServer,
 ) -> Result<(TestCodex, PermissionProfile)> {
@@ -999,14 +997,15 @@ async fn wait_for_unified_exec_end(
                 response_mock.requests().len()
             );
         }
-        let event = match tokio::time::timeout(remaining, test.codex.next_event()).await {
-            Ok(Ok(event)) => event.msg,
-            Ok(Err(err)) => panic!("event stream ended unexpectedly: {err}"),
-            Err(_) => panic!(
-                "timed out waiting for network denial end event; observed {observed_events:?}; response requests: {}",
-                response_mock.requests().len()
-            ),
-        };
+        let timeout_message = format!(
+            "timed out waiting for network denial end event; observed {observed_events:?}; response requests: {}",
+            response_mock.requests().len()
+        );
+        let event = tokio::time::timeout(remaining, test.codex.next_event())
+            .await
+            .expect(&timeout_message)
+            .expect("event stream ended unexpectedly")
+            .msg;
         turn_completed |= matches!(event, EventMsg::TurnComplete(_));
         observed_events.push(format!("{event:?}"));
         if let EventMsg::ExecCommandEnd(ev) = event
@@ -1554,7 +1553,7 @@ async fn exec_command_clamps_model_requested_max_output_tokens_to_policy() -> Re
     assert_eq!(output.original_token_count, Some(8_991));
     let output_text = output.output.replace("\r\n", "\n");
     assert_regex_match(
-        r"^Total output lines: 999\n\nEXEC-LINE-0001 x{20}\nEXEC-LINE-0002 x{20}\nEXEC-LINE-0003 x{13}…8941 tokens truncated…E-0997 x{20}\nEXEC-LINE-0998 x{20}\nEXEC-LINE-0999 x{20}\n$",
+        r"^Warning: truncated output \(original token count: 8991\)\nTotal output lines: 999\n\nEXEC-LINE-0001 x{20}\nEXEC-LINE-0002 x{20}\nEXEC-LINE-0003 x{13}…8941 tokens truncated…E-0997 x{20}\nEXEC-LINE-0998 x{20}\nEXEC-LINE-0999 x{20}\n$",
         &output_text,
     );
 
@@ -1645,7 +1644,7 @@ async fn write_stdin_clamps_model_requested_max_output_tokens_to_policy() -> Res
     assert_eq!(stdin_output.original_token_count, Some(9_492));
     let stdin_output_text = stdin_output.output.replace("\r\n", "\n");
     assert_regex_match(
-        r"^Total output lines: 1000\n\ngo\nSTDIN-LINE-0001 y{20}\nSTDIN-LINE-0002 y{20}\nSTDIN-LINE-0003 yyyy…9442 tokens truncated…7 y{20}\nSTDIN-LINE-0998 y{20}\nSTDIN-LINE-0999 y{20}\n$",
+        r"^Warning: truncated output \(original token count: 9492\)\nTotal output lines: 1000\n\ngo\nSTDIN-LINE-0001 y{20}\nSTDIN-LINE-0002 y{20}\nSTDIN-LINE-0003 yyyy…9442 tokens truncated…7 y{20}\nSTDIN-LINE-0998 y{20}\nSTDIN-LINE-0999 y{20}\n$",
         &stdin_output_text,
     );
 
@@ -2075,9 +2074,10 @@ async fn assert_write_stdin_ctrl_c_interrupts_non_tty_session(
     let server = start_mock_server().await;
 
     let mut builder = test_codex().with_config(|config| {
-        if let Err(err) = config.features.enable(Feature::UnifiedExec) {
-            panic!("test config should allow feature update: {err}");
-        }
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
     });
     let test = builder.build_with_remote_env(&server).await?;
 
@@ -2959,7 +2959,7 @@ PY
     let large_output = outputs.get(call_id).expect("missing large output summary");
 
     let output_text = large_output.output.replace("\r\n", "\n");
-    let truncated_pattern = r"(?s)^Total output lines: \d+\n\n(token token \n){5,}.*…\d+ tokens truncated….*(token token \n){5,}$";
+    let truncated_pattern = r"(?s)^Warning: truncated output \(original token count: \d+\)\nTotal output lines: \d+\n\n(token token \n){5,}.*…\d+ tokens truncated….*(token token \n){5,}$";
     assert_regex_match(truncated_pattern, &output_text);
 
     let original_tokens = large_output

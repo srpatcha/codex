@@ -322,7 +322,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecProcess> for UnifiedExecRunt
             attempt.sandbox,
             attempt.windows_sandbox_level,
         );
-        let command = if matches!(session_shell.shell_type, ShellType::PowerShell) {
+        let command = if matches!(req.shell_type, ShellType::PowerShell) {
             prefix_powershell_script_with_utf8(&command)
         } else {
             command
@@ -427,6 +427,7 @@ mod tests {
     use codex_exec_server::Environment;
     use codex_exec_server::LOCAL_ENVIRONMENT_ID;
     use codex_tools::ZshForkConfig;
+    use codex_utils_path_uri::PathUri;
     use std::sync::Arc;
     use std::time::Duration;
     use tempfile::tempdir;
@@ -435,7 +436,7 @@ mod tests {
         TurnEnvironment::new(
             LOCAL_ENVIRONMENT_ID.to_string(),
             Arc::new(Environment::default_for_tests()),
-            cwd,
+            PathUri::from_abs_path(&cwd),
             /*shell*/ None,
         )
     }

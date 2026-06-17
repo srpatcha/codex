@@ -439,7 +439,7 @@ async fn warm_plugins_and_skills_for_session_init(
     config: Arc<Config>,
     plugins_manager: Arc<PluginsManager>,
     skills_manager: Arc<SkillsManager>,
-    turn_environments: TurnEnvironmentSnapshot,
+    turn_environments: &TurnEnvironmentSnapshot,
 ) -> Vec<SkillError> {
     let fs = turn_environments.primary_filesystem();
     let plugins_input = config.plugins_config_input();
@@ -829,7 +829,7 @@ impl Session {
                 Arc::clone(&config),
                 Arc::clone(&plugins_manager),
                 Arc::clone(&skills_manager),
-                resolved_environments,
+                &resolved_environments,
             )
             .instrument(info_span!(
                 "session_init.plugin_skill_warmup",
@@ -913,8 +913,12 @@ impl Session {
                     (None, None)
                 };
 
-            let hooks =
-                build_hooks_for_config(&config, plugins_manager.as_ref(), &default_shell).await;
+            let hooks = build_hooks_for_config(
+                &config,
+                plugins_manager.as_ref(),
+                resolved_environments.single_local_environment(),
+            )
+            .await;
             for warning in hooks.startup_warnings() {
                 post_session_configured_events.push(Event {
                     id: INITIAL_SUBMIT_ID.to_owned(),
@@ -1115,9 +1119,12 @@ impl Session {
             };
             let mcp_runtime_context = {
                 let turn_environments = sess.services.turn_environments.snapshot().await;
+                // TODO(anp): Migrate MCP runtime cwd plumbing to PathUri so foreign environment
+                // cwd values can be used without falling back to the session host cwd.
                 let cwd = turn_environments
                     .primary()
-                    .map(|turn_environment| turn_environment.cwd().to_path_buf())
+                    .and_then(|turn_environment| turn_environment.cwd().to_abs_path().ok())
+                    .map(|cwd| cwd.to_path_buf())
                     .unwrap_or_else(|| session_configuration.cwd().to_path_buf());
                 McpRuntimeContext::new(
                     sess.services.turn_environments.environment_manager(),

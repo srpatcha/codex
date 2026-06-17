@@ -1,7 +1,7 @@
 use std::ffi::OsStr;
 
 use anyhow::Result;
-use codex_utils_path_uri::ApiPathString;
+use codex_utils_path_uri::LegacyAppPathString;
 use codex_utils_path_uri::PathConvention;
 use codex_utils_path_uri::PathUri;
 
@@ -28,7 +28,7 @@ impl TestEnvironment {
         }
     }
 
-    pub(crate) fn remote_cwd(&self, instance_id: &str) -> Result<Option<ApiPathString>> {
+    pub(crate) fn remote_cwd(&self, instance_id: &str) -> Result<Option<LegacyAppPathString>> {
         let path_uri = match self {
             Self::Local => return Ok(None),
             Self::Docker { .. } => {
@@ -40,7 +40,7 @@ impl TestEnvironment {
                 PathUri::parse(&format!("file:///C:/codex-core-test-cwd-{instance_id}"))?
             }
         };
-        Ok(Some(ApiPathString::from_path_uri(
+        Ok(Some(LegacyAppPathString::from_path_uri(
             &path_uri,
             self.path_convention(),
         )?))
@@ -61,7 +61,7 @@ pub fn test_environment() -> TestEnvironment {
         std::env::var_os(LEGACY_REMOTE_ENV_ENV_VAR).as_deref(),
         std::env::var_os(DOCKER_CONTAINER_ENV_VAR).as_deref(),
     )
-    .unwrap_or_else(|error| panic!("invalid test environment configuration: {error}"));
+    .expect("invalid test environment configuration");
 
     if matches!(environment, TestEnvironment::WineExec) && !cfg!(target_os = "linux") {
         panic!("{TEST_ENVIRONMENT_ENV_VAR}=wine-exec is only supported on Linux");
