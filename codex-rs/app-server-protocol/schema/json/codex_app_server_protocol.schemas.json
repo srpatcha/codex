@@ -2386,6 +2386,14 @@
           ],
           "description": "The command's working directory."
         },
+        "environmentId": {
+          "default": null,
+          "description": "Environment in which the command will run.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "itemId": {
           "type": "string"
         },
@@ -6696,6 +6704,16 @@
               }
             ]
           },
+          "default_tools_approval_mode": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/AppToolApproval"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "destructive_enabled": {
             "default": true,
             "type": "boolean"
@@ -9101,7 +9119,7 @@
             ]
           },
           "includeHome": {
-            "description": "If true, include detection under the user's home (~/.claude, ~/.codex, etc.).",
+            "description": "If true, include detection under the user's home directory.",
             "type": "boolean"
           }
         },
@@ -9264,6 +9282,13 @@
               "$ref": "#/definitions/v2/ExternalAgentConfigMigrationItem"
             },
             "type": "array"
+          },
+          "source": {
+            "description": "Source product that produced the migration items. Missing means unspecified.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -14766,13 +14791,6 @@
                 },
                 "type": "array"
               },
-              "id": {
-                "type": [
-                  "string",
-                  "null"
-                ],
-                "writeOnly": true
-              },
               "metadata": {
                 "anyOf": [
                   {
@@ -14914,14 +14932,6 @@
                   "null"
                 ]
               },
-              "id": {
-                "description": "Legacy id field retained for compatibility with older payloads.",
-                "type": [
-                  "string",
-                  "null"
-                ],
-                "writeOnly": true
-              },
               "metadata": {
                 "anyOf": [
                   {
@@ -14958,13 +14968,6 @@
               },
               "call_id": {
                 "type": "string"
-              },
-              "id": {
-                "type": [
-                  "string",
-                  "null"
-                ],
-                "writeOnly": true
               },
               "metadata": {
                 "anyOf": [
@@ -15013,13 +15016,6 @@
               },
               "execution": {
                 "type": "string"
-              },
-              "id": {
-                "type": [
-                  "string",
-                  "null"
-                ],
-                "writeOnly": true
               },
               "metadata": {
                 "anyOf": [
@@ -15091,13 +15087,6 @@
             "properties": {
               "call_id": {
                 "type": "string"
-              },
-              "id": {
-                "type": [
-                  "string",
-                  "null"
-                ],
-                "writeOnly": true
               },
               "input": {
                 "type": "string"
@@ -15235,13 +15224,6 @@
                   }
                 ]
               },
-              "id": {
-                "type": [
-                  "string",
-                  "null"
-                ],
-                "writeOnly": true
-              },
               "metadata": {
                 "anyOf": [
                   {
@@ -15275,7 +15257,11 @@
           {
             "properties": {
               "id": {
-                "type": "string"
+                "description": "Existing provider ID retained on serialized history for compatibility.",
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "metadata": {
                 "anyOf": [
@@ -15308,7 +15294,6 @@
               }
             },
             "required": [
-              "id",
               "result",
               "status",
               "type"
@@ -15424,6 +15409,12 @@
       },
       "ResponseItemMetadata": {
         "properties": {
+          "source_call_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "turn_id": {
             "type": [
               "string",
@@ -16620,6 +16611,14 @@
           "preview": {
             "description": "Usually the first user message in the thread, if available.",
             "type": "string"
+          },
+          "recencyAt": {
+            "description": "Unix timestamp (in seconds) used for thread recency ordering.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "sessionId": {
             "description": "Session id shared by threads that belong to the same session tree.",
@@ -18880,7 +18879,8 @@
       "ThreadSortKey": {
         "enum": [
           "created_at",
-          "updated_at"
+          "updated_at",
+          "recency_at"
         ],
         "type": "string"
       },
