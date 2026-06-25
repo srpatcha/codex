@@ -24,6 +24,7 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionConfiguredEvent;
 use codex_protocol::protocol::SessionSource;
@@ -41,6 +42,7 @@ use codex_thread_store::ThreadMetadataPatch;
 use codex_thread_store::ThreadStoreError;
 use codex_thread_store::ThreadStoreResult;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::LegacyAppPathString;
 use codex_utils_path_uri::PathUri;
 use rmcp::model::ReadResourceRequestParams;
 use std::collections::BTreeMap;
@@ -73,6 +75,7 @@ pub struct ThreadConfigSnapshot {
     pub forked_from_thread_id: Option<ThreadId>,
     pub parent_thread_id: Option<ThreadId>,
     pub thread_source: Option<ThreadSource>,
+    pub originator: String,
 }
 
 /// Explains why `CodexThread::try_start_turn_if_idle` rejected an automatic
@@ -334,6 +337,13 @@ impl CodexThread {
             .await
     }
 
+    pub async fn set_openai_form_elicitation_support(&self, supported: bool) -> anyhow::Result<()> {
+        self.codex
+            .session
+            .set_openai_form_elicitation_support(supported)
+            .await
+    }
+
     /// Preview persistent thread settings overrides without committing them.
     pub async fn preview_thread_settings_overrides(
         &self,
@@ -438,7 +448,7 @@ impl CodexThread {
             role: "user".to_string(),
             content: vec![ContentItem::InputText { text: message }],
             phase: None,
-            metadata: None,
+            internal_chat_message_metadata_passthrough: None,
         };
         self.codex
             .session
@@ -456,9 +466,15 @@ impl CodexThread {
 
         let turn_context = self.codex.session.new_default_turn().await;
         if self.codex.session.reference_context_item().await.is_none() {
+            // This history-only API runs without run_turn, so it owns its initial step.
+            let step_context = self
+                .codex
+                .session
+                .capture_step_context(Arc::clone(&turn_context))
+                .await;
             self.codex
                 .session
-                .record_context_updates_and_set_reference_context_item(turn_context.as_ref())
+                .record_context_updates_and_set_reference_context_item(step_context.as_ref())
                 .await;
         }
         self.codex
@@ -535,6 +551,18 @@ impl CodexThread {
         live_thread.update_metadata(patch, include_archived).await
     }
 
+    /// Appends rollout items through the live thread so derived metadata stays in sync.
+    pub async fn append_rollout_items(&self, items: &[RolloutItem]) -> ThreadStoreResult<()> {
+        let live_thread = self
+            .codex
+            .session
+            .live_thread_for_persistence("append rollout items")
+            .map_err(|err| ThreadStoreError::Internal {
+                message: err.to_string(),
+            })?;
+        live_thread.append_items(items).await
+    }
+
     pub fn state_db(&self) -> Option<StateDbHandle> {
         self.codex.state_db()
     }
@@ -544,8 +572,17 @@ impl CodexThread {
     }
 
     /// Returns the files that supplied the thread's loaded model instructions.
-    pub async fn instruction_sources(&self) -> Vec<AbsolutePathBuf> {
+    pub async fn instruction_sources(&self) -> Vec<PathUri> {
         self.codex.instruction_sources().await
+    }
+
+    /// Returns loaded instruction sources rendered as legacy app-server path strings.
+    pub async fn legacy_instruction_sources(&self) -> Vec<LegacyAppPathString> {
+        self.instruction_sources()
+            .await
+            .into_iter()
+            .map(Into::into)
+            .collect()
     }
 
     pub async fn config(&self) -> Arc<crate::config::Config> {

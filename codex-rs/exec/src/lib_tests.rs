@@ -334,6 +334,7 @@ async fn resume_lookup_model_providers_filters_only_last_lookup() {
 fn turn_items_for_thread_returns_matching_turn_items() {
     let thread = AppServerThread {
         id: "thread-1".to_string(),
+        extra: None,
         session_id: "thread-1".to_string(),
         forked_from_id: None,
         parent_thread_id: None,
@@ -753,6 +754,7 @@ fn sample_thread_start_response() -> ThreadStartResponse {
     ThreadStartResponse {
         thread: codex_app_server_protocol::Thread {
             id: "67e55044-10b1-426f-9247-bb680e5fe0c8".to_string(),
+            extra: None,
             session_id: "67e55044-10b1-426f-9247-bb680e5fe0c7".to_string(),
             forked_from_id: None,
             parent_thread_id: None,
@@ -790,5 +792,6 @@ fn sample_thread_start_response() -> ThreadStartResponse {
         },
         active_permission_profile: None,
         reasoning_effort: None,
+        multi_agent_mode: Default::default(),
     }
 }

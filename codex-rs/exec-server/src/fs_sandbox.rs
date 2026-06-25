@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use codex_app_server_protocol::JSONRPCErrorError;
+use codex_exec_server_protocol::JSONRPCErrorError;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
@@ -115,6 +115,7 @@ impl FileSystemSandboxRunner {
             args: vec![CODEX_FS_HELPER_ARG1.to_string()],
             cwd: cwd.uri.clone(),
             env: self.helper_env.clone(),
+            managed_network: None,
             additional_permissions: None,
         };
         let native_workspace_roots = sandbox_context
@@ -130,11 +131,14 @@ impl FileSystemSandboxRunner {
         sandbox_manager
             .transform_for_direct_spawn(SandboxDirectSpawnTransformRequest {
                 workspace_roots,
+                windows_sandbox_proxy_settings_mode:
+                    codex_sandboxing::WindowsSandboxProxySettingsMode::Preserve,
                 transform: SandboxTransformRequest {
                     command,
                     permissions: permission_profile,
                     sandbox,
                     enforce_managed_network: false,
+                    environment_id: None,
                     network: None,
                     sandbox_policy_cwd: &cwd.uri,
                     codex_linux_sandbox_exe: self.runtime_paths.codex_linux_sandbox_exe.as_deref(),

@@ -19,13 +19,15 @@ use std::time::Duration;
 
 use async_channel::unbounded;
 use codex_config::Constrained;
+use codex_config::McpServerAuth;
 use codex_config::McpServerConfig;
 use codex_config::McpServerTransportConfig;
 use codex_config::types::AppToolApproval;
 use codex_config::types::AuthKeyringBackendKind;
 use codex_config::types::OAuthCredentialsStoreMode;
+use codex_connectors::ConnectorSnapshot;
 use codex_login::CodexAuth;
-use codex_plugin::PluginCapabilitySummary;
+use codex_model_provider::CHATGPT_CODEX_BASE_URL;
 use codex_protocol::mcp::McpServerInfo;
 use codex_protocol::mcp::Resource;
 use codex_protocol::mcp::ResourceTemplate;
@@ -142,9 +144,9 @@ pub struct McpConfig {
     pub client_elicitation_capability: ElicitationCapability,
     /// Resolved MCP registrations keyed by logical server name.
     pub mcp_server_catalog: ResolvedMcpCatalog,
-    /// Plugin metadata used to attribute connector tools to plugin display names.
+    /// Plugin declarations used to attribute connector tools to plugin display names.
     /// MCP registrations retain their own package attribution in the catalog.
-    pub plugin_capability_summaries: Vec<PluginCapabilitySummary>,
+    pub connector_snapshot: ConnectorSnapshot,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -182,14 +184,16 @@ impl ToolPluginProvenance {
 
     fn from_config(config: &McpConfig) -> Self {
         let mut tool_plugin_provenance = Self::default();
-        for plugin in &config.plugin_capability_summaries {
-            for connector_id in &plugin.app_connector_ids {
-                tool_plugin_provenance
-                    .plugin_display_names_by_connector_id
-                    .entry(connector_id.0.clone())
-                    .or_default()
-                    .push(plugin.display_name.clone());
-            }
+        for connector_id in config.connector_snapshot.connector_ids() {
+            tool_plugin_provenance
+                .plugin_display_names_by_connector_id
+                .insert(
+                    connector_id.0.clone(),
+                    config
+                        .connector_snapshot
+                        .plugin_display_names_for_connector_id(&connector_id.0)
+                        .to_vec(),
+                );
         }
 
         for (server_name, attribution) in config
@@ -255,9 +259,31 @@ pub fn effective_mcp_servers_from_configured(
     config: &McpConfig,
     auth: Option<&CodexAuth>,
 ) -> HashMap<String, EffectiveMcpServer> {
+    let chatgpt_origin = url::Url::parse(CHATGPT_CODEX_BASE_URL)
+        .ok()
+        .map(|url| url.origin());
     let mut servers = configured_servers
         .into_iter()
-        .map(|(name, server)| (name, EffectiveMcpServer::configured(server)))
+        .map(|(name, mut server)| {
+            match server.auth.clone() {
+                McpServerAuth::ChatGpt => {
+                    let server_origin = match &server.transport {
+                        McpServerTransportConfig::StreamableHttp { url, .. } => {
+                            url::Url::parse(url)
+                                .ok()
+                                .filter(|url| matches!(url.scheme(), "http" | "https"))
+                                .map(|url| url.origin())
+                        }
+                        McpServerTransportConfig::Stdio { .. } => None,
+                    };
+                    if server_origin.as_ref() != chatgpt_origin.as_ref() {
+                        server.auth = McpServerAuth::OAuth;
+                    }
+                }
+                McpServerAuth::OAuth => {}
+            }
+            (name, EffectiveMcpServer::configured(server))
+        })
         .collect::<HashMap<_, _>>();
     if !host_owned_codex_apps_enabled(config, auth) {
         servers.remove(CODEX_APPS_MCP_SERVER_NAME);
@@ -277,7 +303,6 @@ pub async fn read_mcp_resource(
     uri: &str,
 ) -> anyhow::Result<ReadResourceResult> {
     let mut mcp_servers = effective_mcp_servers(config, auth);
-    let host_owned_codex_apps_enabled = host_owned_codex_apps_enabled(config, auth);
     mcp_servers.retain(|name, _| name == server);
     let auth_statuses = compute_auth_statuses(
         mcp_servers.iter(),
@@ -302,9 +327,9 @@ pub async fn read_mcp_resource(
         runtime_context,
         config.codex_home.clone(),
         codex_apps_tools_cache_key(auth),
-        host_owned_codex_apps_enabled,
         config.prefix_mcp_tool_names,
         config.client_elicitation_capability.clone(),
+        /*supports_openai_form_elicitation*/ false,
         tool_plugin_provenance(config),
         auth,
         /*elicitation_reviewer*/ None,
@@ -336,7 +361,6 @@ pub async fn collect_mcp_server_status_snapshot_with_detail(
     detail: McpSnapshotDetail,
 ) -> McpServerStatusSnapshot {
     let mcp_servers = effective_mcp_servers(config, auth);
-    let host_owned_codex_apps_enabled = host_owned_codex_apps_enabled(config, auth);
     let tool_plugin_provenance = tool_plugin_provenance(config);
     if mcp_servers.is_empty() {
         return McpServerStatusSnapshot {
@@ -376,9 +400,9 @@ pub async fn collect_mcp_server_status_snapshot_with_detail(
         runtime_context,
         config.codex_home.clone(),
         codex_apps_tools_cache_key(auth),
-        host_owned_codex_apps_enabled,
         config.prefix_mcp_tool_names,
         config.client_elicitation_capability.clone(),
+        /*supports_openai_form_elicitation*/ false,
         tool_plugin_provenance,
         auth,
         /*elicitation_reviewer*/ None,
@@ -457,6 +481,7 @@ pub fn codex_apps_mcp_server_config(
     mcp_server_config_for_url(
         codex_apps_mcp_url_for_base_url(chatgpt_base_url),
         apps_mcp_product_sku,
+        McpServerAuth::ChatGpt,
     )
 }
 
@@ -471,10 +496,18 @@ pub fn hosted_plugin_runtime_mcp_server_config(
     } else {
         format!("{base_url}/api/codex")
     };
-    mcp_server_config_for_url(format!("{base_url}/ps/mcp"), apps_mcp_product_sku)
+    mcp_server_config_for_url(
+        format!("{base_url}/ps/mcp"),
+        apps_mcp_product_sku,
+        McpServerAuth::ChatGpt,
+    )
 }
 
-fn mcp_server_config_for_url(url: String, apps_mcp_product_sku: Option<&str>) -> McpServerConfig {
+fn mcp_server_config_for_url(
+    url: String,
+    apps_mcp_product_sku: Option<&str>,
+    auth_mode: McpServerAuth,
+) -> McpServerConfig {
     let http_headers = apps_mcp_product_sku.map(|product_sku| {
         HashMap::from([("X-OpenAI-Product-Sku".to_string(), product_sku.to_string())])
     });
@@ -486,6 +519,7 @@ fn mcp_server_config_for_url(url: String, apps_mcp_product_sku: Option<&str>) ->
             http_headers,
             env_http_headers: None,
         },
+        auth: auth_mode,
         environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
         enabled: true,
         required: false,
@@ -617,14 +651,16 @@ async fn collect_mcp_server_status_snapshot_from_manager(
         mcp_connection_manager.list_all_tools(),
         async {
             if detail.include_resources() {
-                mcp_connection_manager.list_all_resources().await
+                mcp_connection_manager.list_all_resources(|_| true).await
             } else {
                 HashMap::new()
             }
         },
         async {
             if detail.include_resources() {
-                mcp_connection_manager.list_all_resource_templates().await
+                mcp_connection_manager
+                    .list_all_resource_templates(|_| true)
+                    .await
             } else {
                 HashMap::new()
             }

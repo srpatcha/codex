@@ -538,12 +538,10 @@ async fn plugin_install_tracks_analytics_when_remote_detail_fetch_fails() -> Res
         payload["events"][0]["event_type"],
         "codex_plugin_install_failed"
     );
-    assert_eq!(event_params["plugin_id"], REMOTE_PLUGIN_ID);
-    assert_eq!(event_params["plugin_name"], "unknown");
-    assert_eq!(
-        event_params["marketplace_name"],
-        "caller-marketplace-is-ignored"
-    );
+    assert_eq!(event_params["plugin_id"], json!(null));
+    assert_eq!(event_params["remote_plugin_id"], REMOTE_PLUGIN_ID);
+    assert_eq!(event_params["plugin_name"], json!(null));
+    assert_eq!(event_params["marketplace_name"], json!(null));
     assert_eq!(
         event_params["error_type"],
         "remote_catalog_unexpected_status"
@@ -883,6 +881,7 @@ async fn plugin_install_tracks_analytics_event() -> Result<()> {
                 "event_type": "codex_plugin_installed",
                 "event_params": {
                     "plugin_id": "sample-plugin@debug",
+                    "remote_plugin_id": null,
                     "plugin_name": "sample-plugin",
                     "marketplace_name": "debug",
                     "has_skills": false,
@@ -946,6 +945,7 @@ async fn plugin_install_failure_tracks_analytics_event() -> Result<()> {
         "codex_plugin_install_failed"
     );
     assert_eq!(event_params["plugin_id"], "sample-plugin@debug");
+    assert_eq!(event_params["remote_plugin_id"], json!(null));
     assert_eq!(event_params["plugin_name"], "sample-plugin");
     assert_eq!(event_params["marketplace_name"], "debug");
     assert_eq!(event_params["has_skills"], json!(null));
@@ -995,7 +995,8 @@ async fn plugin_install_tracks_remote_plugin_analytics_event() -> Result<()> {
             "events": [{
                 "event_type": "codex_plugin_installed",
                 "event_params": {
-                    "plugin_id": REMOTE_PLUGIN_ID,
+                    "plugin_id": "linear@openai-curated-remote",
+                    "remote_plugin_id": REMOTE_PLUGIN_ID,
                     "plugin_name": "linear",
                     "marketplace_name": "openai-curated-remote",
                     "has_skills": true,
@@ -1010,15 +1011,12 @@ async fn plugin_install_tracks_remote_plugin_analytics_event() -> Result<()> {
 }
 
 #[tokio::test]
-async fn plugin_install_errors_when_remote_bundle_download_fails() -> Result<()> {
+async fn plugin_install_preserves_status_when_remote_bundle_error_body_is_too_large() -> Result<()>
+{
     let codex_home = TempDir::new()?;
     let server = MockServer::start().await;
-    let bundle_url = mount_remote_plugin_bundle(
-        &server,
-        /*status_code*/ 503,
-        b"bundle temporarily unavailable".to_vec(),
-    )
-    .await;
+    let bundle_url =
+        mount_remote_plugin_bundle(&server, /*status_code*/ 503, vec![b'x'; 8 * 1024 + 1]).await;
     configure_remote_plugin_test(codex_home.path(), &server)?;
     mount_remote_plugin_detail(&server, REMOTE_PLUGIN_ID, "1.2.3", Some(&bundle_url)).await;
     mount_empty_remote_installed_plugins(&server).await;
@@ -1041,6 +1039,20 @@ async fn plugin_install_errors_when_remote_bundle_download_fails() -> Result<()>
 
     assert_eq!(err.error.code, -32603);
     assert!(err.error.message.contains("failed with status 503"));
+    assert!(
+        err.error
+            .message
+            .contains("[response body truncated after 8192 bytes]")
+    );
+    assert_eq!(
+        err.error
+            .message
+            .bytes()
+            .filter(|byte| *byte == b'x')
+            .count(),
+        8192
+    );
+    assert!(!err.error.message.contains("exceeded maximum size"));
     wait_for_remote_plugin_request_count(
         &server,
         "GET",
@@ -1061,7 +1073,8 @@ async fn plugin_install_errors_when_remote_bundle_download_fails() -> Result<()>
         payload["events"][0]["event_type"],
         "codex_plugin_install_failed"
     );
-    assert_eq!(event_params["plugin_id"], REMOTE_PLUGIN_ID);
+    assert_eq!(event_params["plugin_id"], "linear@openai-curated-remote");
+    assert_eq!(event_params["remote_plugin_id"], REMOTE_PLUGIN_ID);
     assert_eq!(event_params["marketplace_name"], "openai-curated-remote");
     assert_eq!(event_params["error_type"], "remote_bundle_download_status");
     assert!(
@@ -1082,6 +1095,8 @@ async fn plugin_install_returns_apps_needing_auth() -> Result<()> {
             description: Some("Alpha connector".to_string()),
             logo_url: Some("https://example.com/alpha.png".to_string()),
             logo_url_dark: None,
+            icon_assets: None,
+            icon_dark_assets: None,
             distribution_channel: Some("featured".to_string()),
             branding: None,
             app_metadata: None,
@@ -1097,6 +1112,8 @@ async fn plugin_install_returns_apps_needing_auth() -> Result<()> {
             description: Some("Beta connector".to_string()),
             logo_url: None,
             logo_url_dark: None,
+            icon_assets: None,
+            icon_dark_assets: None,
             distribution_channel: None,
             branding: None,
             app_metadata: None,
@@ -1181,6 +1198,8 @@ async fn plugin_install_skips_mcp_oauth_for_chatgpt_dual_surface_plugin() -> Res
         description: Some("Sample MCP connector".to_string()),
         logo_url: Some("https://example.com/alpha.png".to_string()),
         logo_url_dark: None,
+        icon_assets: None,
+        icon_dark_assets: None,
         distribution_channel: Some("featured".to_string()),
         branding: None,
         app_metadata: None,
@@ -1245,7 +1264,7 @@ async fn plugin_install_skips_mcp_oauth_for_chatgpt_dual_surface_plugin() -> Res
 }
 
 #[tokio::test]
-async fn plugin_install_starts_mcp_oauth_when_only_plugin_apps_are_disallowed() -> Result<()> {
+async fn plugin_install_starts_mcp_oauth_with_formerly_disallowed_plugin_app() -> Result<()> {
     let (apps_server_url, apps_server_handle, _apps_server_control) =
         start_apps_server(Vec::new(), Vec::new()).await?;
     let oauth_server = MockServer::start().await;
@@ -1296,12 +1315,117 @@ async fn plugin_install_starts_mcp_oauth_when_only_plugin_apps_are_disallowed() 
     .await??;
     let response: PluginInstallResponse = to_response(response)?;
 
-    assert_eq!(response.auth_policy, PluginAuthPolicy::OnInstall);
-    assert_eq!(response.apps_needing_auth, Vec::<AppSummary>::new());
+    assert_eq!(
+        response,
+        PluginInstallResponse {
+            auth_policy: PluginAuthPolicy::OnInstall,
+            apps_needing_auth: vec![AppSummary {
+                id: "asdk_app_6938a94a61d881918ef32cb999ff937c".to_string(),
+                name: "asdk_app_6938a94a61d881918ef32cb999ff937c".to_string(),
+                description: None,
+                install_url: Some(
+                    "https://chatgpt.com/apps/asdk-app-6938a94a61d881918ef32cb999ff937c/asdk_app_6938a94a61d881918ef32cb999ff937c"
+                        .to_string(),
+                ),
+                category: None,
+            }],
+        }
+    );
     assert!(oauth_discovery_request_count(&oauth_server).await > 0);
 
     apps_server_handle.abort();
     let _ = apps_server_handle.await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn plugin_install_starts_mcp_oauth_through_protected_resource_metadata() -> Result<()> {
+    let resource_server = MockServer::start().await;
+    let authorization_server = MockServer::start().await;
+    let resource_metadata_url = format!("{}/oauth-resource", resource_server.uri());
+    let challenge = format!("Bearer resource_metadata=\"{resource_metadata_url}\"");
+    Mock::given(method("GET"))
+        .and(path("/mcp"))
+        .respond_with(
+            ResponseTemplate::new(401).insert_header("WWW-Authenticate", challenge.as_str()),
+        )
+        .mount(&resource_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/oauth-resource"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "resource": resource_server.uri(),
+            "authorization_servers": [authorization_server.uri()],
+        })))
+        .mount(&resource_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/.well-known/oauth-authorization-server"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "authorization_endpoint": format!("{}/oauth/authorize", authorization_server.uri()),
+            "token_endpoint": format!("{}/oauth/token", authorization_server.uri()),
+            "registration_endpoint": format!("{}/oauth/register", authorization_server.uri()),
+            "response_types_supported": ["code"],
+            "code_challenge_methods_supported": ["S256"],
+        })))
+        .mount(&authorization_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/register"))
+        .respond_with(ResponseTemplate::new(400))
+        .mount(&authorization_server)
+        .await;
+
+    let codex_home = TempDir::new()?;
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        "[features]\nplugins = true\n",
+    )?;
+    let repo_root = TempDir::new()?;
+    write_plugin_marketplace(
+        repo_root.path(),
+        "debug",
+        "sample-plugin",
+        "./sample-plugin",
+        /*install_policy*/ None,
+        /*auth_policy*/ None,
+    )?;
+    write_plugin_source(repo_root.path(), "sample-plugin", &[])?;
+    write_plugin_mcp_config(repo_root.path(), "sample-plugin", &resource_server.uri())?;
+    let marketplace_path =
+        AbsolutePathBuf::try_from(repo_root.path().join(".agents/plugins/marketplace.json"))?;
+
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+
+    let request_id = mcp
+        .send_plugin_install_request(PluginInstallParams {
+            marketplace_path: Some(marketplace_path),
+            remote_marketplace_name: None,
+            plugin_name: "sample-plugin".to_string(),
+        })
+        .await?;
+    let response: JSONRPCResponse = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    let _: PluginInstallResponse = to_response(response)?;
+    wait_for_remote_plugin_request_count(
+        &authorization_server,
+        "POST",
+        "/oauth/register",
+        /*expected_count*/ 1,
+    )
+    .await?;
+
+    let resource_metadata_requested = resource_server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .any(|request| request.url.path() == "/oauth-resource");
+    assert!(resource_metadata_requested);
     Ok(())
 }
 
@@ -1461,13 +1585,15 @@ async fn plugin_install_skips_remote_mcp_oauth_for_bundled_same_name_app() -> Re
 }
 
 #[tokio::test]
-async fn plugin_install_filters_disallowed_apps_needing_auth() -> Result<()> {
+async fn plugin_install_includes_formerly_disallowed_apps_needing_auth() -> Result<()> {
     let connectors = vec![AppInfo {
         id: "alpha".to_string(),
         name: "Alpha".to_string(),
         description: Some("Alpha connector".to_string()),
         logo_url: Some("https://example.com/alpha.png".to_string()),
         logo_url_dark: None,
+        icon_assets: None,
+        icon_dark_assets: None,
         distribution_channel: Some("featured".to_string()),
         branding: None,
         app_metadata: None,
@@ -1537,6 +1663,16 @@ async fn plugin_install_filters_disallowed_apps_needing_auth() -> Result<()> {
                 name: "Alpha".to_string(),
                 description: Some("Alpha connector".to_string()),
                 install_url: Some("https://chatgpt.com/apps/alpha/alpha".to_string()),
+                category: None,
+            },
+            AppSummary {
+                id: "asdk_app_6938a94a61d881918ef32cb999ff937c".to_string(),
+                name: "asdk_app_6938a94a61d881918ef32cb999ff937c".to_string(),
+                description: None,
+                install_url: Some(
+                    "https://chatgpt.com/apps/asdk-app-6938a94a61d881918ef32cb999ff937c/asdk_app_6938a94a61d881918ef32cb999ff937c"
+                        .to_string(),
+                ),
                 category: None,
             }],
         }

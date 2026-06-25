@@ -14,6 +14,8 @@ use crate::exec::execute_exec_request;
 #[cfg(target_os = "macos")]
 use crate::spawn::CODEX_SANDBOX_ENV_VAR;
 use crate::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR;
+use codex_file_system::FileSystemSandboxContext;
+use codex_network_proxy::ManagedNetworkSandboxContext;
 use codex_network_proxy::NetworkProxy;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::exec_output::ExecToolCallOutput;
@@ -47,6 +49,7 @@ pub struct ExecRequest {
     pub env: HashMap<String, String>,
     pub(crate) exec_server_env_config: Option<ExecServerEnvConfig>,
     pub network: Option<NetworkProxy>,
+    pub network_environment_id: Option<String>,
     pub expiration: ExecExpiration,
     pub capture_policy: ExecCapturePolicy,
     pub sandbox: SandboxType,
@@ -59,6 +62,9 @@ pub struct ExecRequest {
     pub network_sandbox_policy: NetworkSandboxPolicy,
     pub(crate) windows_sandbox_filesystem_overrides: Option<WindowsSandboxFilesystemOverrides>,
     pub arg0: Option<String>,
+    pub(crate) exec_server_sandbox: Option<FileSystemSandboxContext>,
+    pub(crate) exec_server_enforce_managed_network: bool,
+    pub(crate) exec_server_managed_network: Option<ManagedNetworkSandboxContext>,
 }
 
 impl ExecRequest {
@@ -68,6 +74,7 @@ impl ExecRequest {
         cwd: AbsolutePathBuf,
         env: HashMap<String, String>,
         network: Option<NetworkProxy>,
+        network_environment_id: Option<String>,
         expiration: ExecExpiration,
         capture_policy: ExecCapturePolicy,
         sandbox: SandboxType,
@@ -87,6 +94,7 @@ impl ExecRequest {
             env,
             exec_server_env_config: None,
             network,
+            network_environment_id,
             expiration,
             capture_policy,
             sandbox,
@@ -99,6 +107,9 @@ impl ExecRequest {
             network_sandbox_policy,
             windows_sandbox_filesystem_overrides: None,
             arg0,
+            exec_server_sandbox: None,
+            exec_server_enforce_managed_network: false,
+            exec_server_managed_network: None,
         }
     }
 
@@ -113,6 +124,7 @@ impl ExecRequest {
             sandbox_policy_cwd: windows_sandbox_policy_cwd,
             mut env,
             network,
+            network_environment_id,
             sandbox,
             windows_sandbox_level,
             windows_sandbox_private_desktop,
@@ -141,6 +153,7 @@ impl ExecRequest {
             env,
             exec_server_env_config: None,
             network,
+            network_environment_id,
             expiration,
             capture_policy,
             sandbox,
@@ -153,6 +166,9 @@ impl ExecRequest {
             network_sandbox_policy,
             windows_sandbox_filesystem_overrides: None,
             arg0,
+            exec_server_sandbox: None,
+            exec_server_enforce_managed_network: false,
+            exec_server_managed_network: None,
         }
     }
 }
