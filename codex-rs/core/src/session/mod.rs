@@ -14,15 +14,15 @@ use crate::agent::AgentControl;
 use crate::agent::AgentStatus;
 use crate::agent::agent_status_from_event;
 use crate::agent::status::is_final;
+use crate::agent_communication::AgentCommunicationContext;
+use crate::agent_communication::AgentCommunicationKind;
 use crate::attestation::AttestationProvider;
 use crate::build_available_skills;
 use crate::compact;
 use crate::config::ManagedFeatures;
 use crate::config::resolve_tool_suggest_config_from_layer_stack;
-use crate::connectors;
+use crate::context::ApprovalPromptContext;
 use crate::context::ApprovedCommandPrefixSaved;
-use crate::context::AppsInstructions;
-use crate::context::AvailablePluginsInstructions;
 use crate::context::AvailableSkillsInstructions;
 use crate::context::CollaborationModeInstructions;
 use crate::context::ContextualUserFragment;
@@ -55,6 +55,7 @@ use codex_analytics::SubAgentThreadStartedInput;
 use codex_analytics::TurnCodexErrorFact;
 use codex_config::types::AuthKeyringBackendKind;
 use codex_config::types::OAuthCredentialsStoreMode;
+use codex_connectors::connector_runtime_context_key;
 use codex_exec_server::Environment;
 use codex_exec_server::EnvironmentManager;
 use codex_extension_api::ExtensionDataInit;
@@ -73,7 +74,6 @@ use codex_login::auth_env_telemetry::collect_auth_env_telemetry;
 use codex_mcp::McpConnectionManager;
 use codex_mcp::McpResourceClient;
 use codex_mcp::McpRuntimeContext;
-use codex_mcp::codex_apps_tools_cache_key;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_models_manager::manager::SharedModelsManager;
 use codex_network_proxy::NetworkProxy;
@@ -92,12 +92,12 @@ use codex_protocol::approvals::NetworkPolicyRuleAction;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::ModeKind;
-use codex_protocol::config_types::MultiAgentMode;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::config_types::Settings;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::dynamic_tools::DynamicToolResponse;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
+use codex_protocol::items::EnteredReviewModeItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::items::UserMessageItem;
 use codex_protocol::models::ActivePermissionProfile;
@@ -118,7 +118,6 @@ use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::ItemStartedEvent;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::RawResponseItemEvent;
-use codex_protocol::protocol::ReviewRequest;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
@@ -333,11 +332,11 @@ use codex_core_plugins::PluginsManager;
 use codex_core_plugins::RecommendedPluginCandidatesInput;
 use codex_git_utils::get_git_repo_root;
 use codex_mcp::McpConfig;
-use codex_mcp::compute_auth_statuses;
 use codex_mcp::effective_mcp_servers;
 use codex_otel::SessionTelemetry;
 use codex_otel::THREAD_STARTED_METRIC;
 use codex_otel::TelemetryAuthMode;
+use codex_protocol::ResponseItemId;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
@@ -573,13 +572,16 @@ impl Codex {
                 codex_models_manager::manager::RefreshStrategy::Offline
             )
         {
-            let _ = models_manager.list_models(refresh_strategy).await;
+            let _ = models_manager
+                .list_models(refresh_strategy, config.http_client_factory())
+                .await;
         }
         let model = models_manager
             .get_default_model(
                 &config.model,
                 allow_provider_model_fallback,
                 refresh_strategy,
+                config.http_client_factory(),
             )
             .await;
         if allow_provider_model_fallback
@@ -631,11 +633,14 @@ impl Codex {
                 developer_instructions: None,
             },
         };
-        let service_tier = get_service_tier(
-            config.service_tier.clone(),
-            config.features.enabled(Feature::FastMode),
+        let fast_mode_enabled = config.features.enabled(Feature::FastMode);
+        let initial_service_tier_warning = unsupported_service_tier_warning(
+            config.service_tier.as_deref(),
+            fast_mode_enabled,
             &model_info,
         );
+        let service_tier =
+            get_service_tier(config.service_tier.clone(), fast_mode_enabled, &model_info);
         let session_configuration = SessionConfiguration {
             provider: config.model_provider.clone(),
             collaboration_mode,
@@ -653,7 +658,6 @@ impl Codex {
                 config.cwd.clone(),
                 environment_selections,
             ),
-            workspace_roots: config.workspace_roots.clone(),
             codex_home: config.codex_home.clone(),
             thread_name: None,
             original_config_do_not_use: Arc::clone(&config),
@@ -708,6 +712,14 @@ impl Codex {
             error!("Failed to create session: {e:#}");
             map_session_init_error(&e, &config.codex_home)
         })?;
+        if let Some(message) = initial_service_tier_warning {
+            session
+                .send_event_raw(Event {
+                    id: INITIAL_SUBMIT_ID.to_owned(),
+                    msg: EventMsg::Warning(WarningEvent { message }),
+                })
+                .await;
+        }
         let thread_id = session.thread_id;
 
         // This task will run until Op::Shutdown is received.
@@ -910,6 +922,22 @@ fn get_service_tier(
     })
 }
 
+fn unsupported_service_tier_warning(
+    configured_service_tier: Option<&str>,
+    fast_mode_enabled: bool,
+    model_info: &ModelInfo,
+) -> Option<String> {
+    let service_tier = configured_service_tier.filter(|service_tier| {
+        fast_mode_enabled
+            && *service_tier != SERVICE_TIER_DEFAULT_REQUEST_VALUE
+            && !model_info.supports_service_tier(service_tier)
+    })?;
+    Some(format!(
+        "Configured service tier `{service_tier}` is not advertised as supported for model `{}` and will be omitted from requests.",
+        model_info.slug
+    ))
+}
+
 fn session_permission_profile_state_from_config(
     config: &Config,
 ) -> CodexResult<PermissionProfileState> {
@@ -1102,6 +1130,10 @@ impl Session {
                 spec
             }
         };
+        if cfg!(target_os = "windows") && !spec.enabled() {
+            self.services.network_proxy.store(None);
+            return;
+        }
         if let Some(started_proxy) = self.services.network_proxy.load_full() {
             if let Err(err) = spec.apply_to_started_proxy(started_proxy.as_ref()).await {
                 warn!("failed to refresh managed network proxy for sandbox change: {err}");
@@ -1141,12 +1173,8 @@ impl Session {
         state.session_configuration.codex_home().clone()
     }
 
-    pub(crate) fn subscribe_out_of_band_elicitation_pause_state(&self) -> watch::Receiver<bool> {
-        self.out_of_band_elicitation_paused.subscribe()
-    }
-
-    pub(crate) fn set_out_of_band_elicitation_pause_state(&self, paused: bool) {
-        self.out_of_band_elicitation_paused.send_replace(paused);
+    pub(crate) fn subscribe_elicitation_pause_state(&self) -> watch::Receiver<bool> {
+        self.services.elicitations.subscribe()
     }
 
     pub(crate) fn get_tx_event(&self) -> Sender<Event> {
@@ -1354,7 +1382,7 @@ impl Session {
             }
             InitialHistory::Forked(mut rollout_items) => {
                 let turn_context = self.new_default_turn().await;
-                if turn_context.config.features.enabled(Feature::ItemIds) {
+                if turn_context.item_ids_enabled() {
                     for rollout_item in &mut rollout_items {
                         if let RolloutItem::ResponseItem(response_item) = rollout_item {
                             Self::assign_missing_response_item_id(response_item);
@@ -1751,7 +1779,7 @@ impl Session {
                 .terminal_error
                 .lock()
                 .await
-                .replace(error.message.clone());
+                .replace(error.clone());
         }
         self.services
             .rollout_thread_trace
@@ -1773,6 +1801,9 @@ impl Session {
 
         let show_raw_agent_reasoning = self.show_raw_agent_reasoning();
         for legacy in legacy_source.as_legacy_events(show_raw_agent_reasoning) {
+            self.services
+                .rollout_thread_trace
+                .record_tool_call_event(turn_context.sub_id.clone(), &legacy);
             let legacy_event = Event {
                 id: turn_context.sub_id.clone(),
                 msg: legacy,
@@ -1806,7 +1837,7 @@ impl Session {
 
         let status = match turn_context.terminal_error.lock().await.take() {
             Some(error) => {
-                let status = AgentStatus::Errored(error);
+                let status = AgentStatus::Errored(error.message);
                 self.agent_status.send_replace(status.clone());
                 status
             }
@@ -1867,10 +1898,12 @@ impl Session {
             message,
             /*trigger_turn*/ false,
         );
+        let context =
+            AgentCommunicationContext::new(AgentCommunicationKind::Result, self.thread_id);
         if let Err(err) = self
             .services
             .agent_control
-            .send_inter_agent_communication(parent_thread_id, communication)
+            .send_inter_agent_communication(parent_thread_id, communication, context)
             .await
         {
             debug!("failed to notify parent thread {parent_thread_id}: {err}");
@@ -1914,9 +1947,29 @@ impl Session {
     }
 
     pub(crate) async fn send_event_raw(&self, event: Event) {
-        // Persist the event into rollout storage (the store filters as needed).
-        let rollout_items = vec![RolloutItem::EventMsg(event.msg.clone())];
-        self.persist_rollout_items(&rollout_items).await;
+        self.send_event_raw_with_persistence(event, /*persist*/ true)
+            .await;
+    }
+
+    /// Delivers an event without creating a local rollout for a thread that has not materialized.
+    pub(crate) async fn send_event_raw_without_materializing_rollout(&self, event: Event) {
+        let persist = match self.current_rollout_path().await {
+            Ok(Some(path)) => codex_rollout::existing_rollout_path(&path).await.is_some(),
+            Ok(None) => true,
+            Err(err) => {
+                warn!("failed to check whether thread persistence is materialized: {err}");
+                true
+            }
+        };
+        self.send_event_raw_with_persistence(event, persist).await;
+    }
+
+    async fn send_event_raw_with_persistence(&self, event: Event, persist: bool) {
+        // Persist the event into rollout storage; the store applies its persistence policy.
+        if persist {
+            let rollout_items = vec![RolloutItem::EventMsg(event.msg.clone())];
+            self.persist_rollout_items(&rollout_items).await;
+        }
         self.services
             .rollout_thread_trace
             .record_protocol_event(&event.msg);
@@ -2131,6 +2184,7 @@ impl Session {
         additional_permissions: Option<AdditionalPermissionProfile>,
         available_decisions: Option<Vec<ReviewDecision>>,
     ) -> ReviewDecision {
+        let _elicitation = self.services.elicitations.register();
         //  command-level approvals use `call_id`.
         // `approval_id` is only present for subcommand callbacks (execve intercept)
         let effective_approval_id = approval_id.clone().unwrap_or_else(|| call_id.clone());
@@ -2202,7 +2256,8 @@ impl Session {
         changes: HashMap<PathBuf, FileChange>,
         reason: Option<String>,
         grant_root: Option<PathBuf>,
-    ) -> oneshot::Receiver<ReviewDecision> {
+    ) -> ReviewDecision {
+        let _elicitation = self.services.elicitations.register();
         // Add the tx_approve callback to the map before sending the request.
         let (tx_approve, rx_approve) = oneshot::channel();
         let approval_id = call_id.clone();
@@ -2229,7 +2284,7 @@ impl Session {
             grant_root,
         });
         self.send_event(turn_context, event).await;
-        rx_approve
+        rx_approve.await.unwrap_or(ReviewDecision::Abort)
     }
 
     #[expect(
@@ -2357,6 +2412,7 @@ impl Session {
             return Some(response);
         }
 
+        let _elicitation = self.services.elicitations.register();
         let (tx_response, rx_response) = oneshot::channel();
         let prev_entry = {
             let mut active = self.active_turn.lock().await;
@@ -2448,6 +2504,7 @@ impl Session {
         call_id: String,
         args: RequestUserInputArgs,
     ) -> Option<RequestUserInputResponse> {
+        let _elicitation = self.services.elicitations.register();
         let sub_id = turn_context.sub_id.clone();
         let (tx_response, rx_response) = oneshot::channel();
         let event_id = sub_id.clone();
@@ -2722,7 +2779,7 @@ impl Session {
         for item in items.to_mut() {
             item.set_turn_id_if_missing(&turn_context.sub_id);
         }
-        if turn_context.config.features.enabled(Feature::ItemIds) {
+        if turn_context.item_ids_enabled() {
             Self::assign_missing_response_item_ids(items)
         } else {
             items
@@ -2730,7 +2787,10 @@ impl Session {
     }
 
     fn assign_missing_response_item_ids(items: Cow<'_, [ResponseItem]>) -> Cow<'_, [ResponseItem]> {
-        if items.iter().all(|item| item.id().is_some()) {
+        if items
+            .iter()
+            .all(|item| item.id().is_some_and(|id| !id.is_empty()))
+        {
             return items;
         }
         let mut items = items;
@@ -2741,27 +2801,13 @@ impl Session {
     }
 
     fn assign_missing_response_item_id(item: &mut ResponseItem) {
-        if item.id().is_some() {
+        if item.id().is_some_and(|id| !id.is_empty()) {
             return;
         }
-        let prefix = match item {
-            ResponseItem::AdditionalTools { .. } => "at",
-            ResponseItem::Message { .. } => "msg",
-            ResponseItem::Reasoning { .. } => "rs",
-            ResponseItem::LocalShellCall { .. } => "lsh",
-            ResponseItem::FunctionCall { .. } => "fc",
-            ResponseItem::ToolSearchCall { .. } => "tsc",
-            ResponseItem::FunctionCallOutput { .. } => "fco",
-            ResponseItem::CustomToolCall { .. } => "ctc",
-            ResponseItem::CustomToolCallOutput { .. } => "ctco",
-            ResponseItem::ToolSearchOutput { .. } => "tso",
-            ResponseItem::WebSearchCall { .. } => "ws",
-            ResponseItem::ImageGenerationCall { .. } => "ig",
-            ResponseItem::Compaction { .. } | ResponseItem::ContextCompaction { .. } => "cmp",
-            ResponseItem::AgentMessage { .. } => "amsg",
-            ResponseItem::CompactionTrigger { .. } | ResponseItem::Other => return,
+        let Some(prefix) = item.id_prefix() else {
+            return;
         };
-        item.set_id(Some(format!("{prefix}_{}", Uuid::now_v7())));
+        item.set_id(Some(ResponseItemId::new(prefix)));
     }
 
     pub(crate) fn response_item_from_user_input(&self, input: Vec<UserInput>) -> ResponseItem {
@@ -2831,6 +2877,7 @@ impl Session {
     /// This may refresh filesystem-derived state. Normal turns should call it only from
     /// `run_turn` and pass the result down; standalone request or history boundaries may capture
     /// their own step.
+    #[tracing::instrument(name = "step_context.capture", level = "info", skip_all)]
     pub(crate) async fn capture_step_context(
         self: &Arc<Self>,
         turn_context: Arc<TurnContext>,
@@ -2980,7 +3027,7 @@ impl Session {
         world_state_baseline: Option<Arc<WorldState>>,
         compacted_item: CompactedItem,
     ) {
-        let items = if turn_context.config.features.enabled(Feature::ItemIds) {
+        let items = if turn_context.item_ids_enabled() {
             Self::assign_missing_response_item_ids(Cow::Owned(items)).into_owned()
         } else {
             items
@@ -3179,7 +3226,14 @@ impl Session {
                 PermissionsInstructions::from_permission_profile(
                     &turn_context.permission_profile,
                     turn_context.approval_policy.value(),
-                    turn_context.config.approvals_reviewer,
+                    ApprovalPromptContext::new(
+                        turn_context.config.approvals_reviewer,
+                        turn_context
+                            .model_info
+                            .model_messages
+                            .as_ref()
+                            .and_then(|messages| messages.approvals.as_ref()),
+                    ),
                     self.services.exec_policy.current().as_ref(),
                     #[allow(deprecated)]
                     &turn_context.cwd,
@@ -3236,19 +3290,6 @@ impl Session {
                     .push(PersonalitySpecInstructions::new(personality_message).render());
             }
         }
-        if turn_context.config.include_apps_instructions && turn_context.apps_enabled() {
-            let accessible_and_enabled_connectors =
-                connectors::list_accessible_and_enabled_connectors_from_manager(
-                    mcp.manager(),
-                    &turn_context.config,
-                )
-                .await;
-            if let Some(apps_instructions) =
-                AppsInstructions::from_connectors(&accessible_and_enabled_connectors)
-            {
-                developer_sections.push(apps_instructions.render());
-            }
-        }
         if turn_context.config.include_skill_instructions {
             let available_skills = build_available_skills(
                 turn_context.turn_skills.snapshot.outcome(),
@@ -3259,7 +3300,10 @@ impl Session {
             );
             if let Some(available_skills) = available_skills {
                 let warning_message = available_skills.warning_message.clone();
-                let skills_instructions = AvailableSkillsInstructions::from(available_skills);
+                let skills_instructions = AvailableSkillsInstructions::from_available_skills(
+                    &available_skills,
+                    turn_context.model_info.include_skills_usage_instructions,
+                );
                 if let Some(warning_message) = warning_message {
                     self.send_event_raw(Event {
                         id: String::new(),
@@ -3299,11 +3343,6 @@ impl Session {
             .and_then(RecommendedPluginsInstructions::from_plugins)
         {
             contextual_user_sections.push(recommended_plugins.render());
-        }
-        if let Some(plugin_instructions) =
-            AvailablePluginsInstructions::from_plugins(loaded_plugins.capability_summaries())
-        {
-            developer_sections.push(plugin_instructions.render());
         }
         let context_contributors = self.services.extensions.context_contributors().to_vec();
         for contributor in &context_contributors {
@@ -3423,16 +3462,10 @@ impl Session {
         {
             items.push(usage_hint_message);
         }
-        match multi_agents::effective_multi_agent_mode(turn_context) {
-            Some(
-                multi_agent_mode
-                @ (MultiAgentMode::ExplicitRequestOnly | MultiAgentMode::Proactive),
-            ) => {
-                items.push(ContextualUserFragment::into(
-                    MultiAgentModeInstructions::new(multi_agent_mode),
-                ));
-            }
-            Some(MultiAgentMode::None) | None => {}
+        if let Some(multi_agent_mode) = multi_agents::effective_multi_agent_mode(turn_context) {
+            items.push(ContextualUserFragment::into(
+                MultiAgentModeInstructions::new(multi_agent_mode),
+            ));
         }
         if let Some(contextual_user_message) =
             crate::context_manager::updates::build_contextual_user_message(contextual_user_sections)
@@ -4031,6 +4064,10 @@ async fn build_hooks_for_config(
         shell_args: hook_shell_argv,
     })
 }
+
+#[cfg(test)]
+#[path = "elicitation_holders_tests.rs"]
+mod elicitation_holders_tests;
 
 #[cfg(test)]
 pub(crate) mod tests;

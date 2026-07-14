@@ -54,6 +54,7 @@ use codex_app_server_protocol::TextPosition as AppTextPosition;
 use codex_app_server_protocol::TextRange as AppTextRange;
 use codex_config::ConfigLayerSource;
 use codex_config::ConfigLoadError;
+use codex_config::ConstraintError;
 use codex_config::TextRange as CoreTextRange;
 use codex_core::ExecPolicyError;
 use codex_core::check_execpolicy_for_warnings;
@@ -86,7 +87,6 @@ mod attestation;
 mod auth_mode;
 mod bespoke_event_handling;
 mod command_exec;
-mod config;
 mod config_layer;
 mod config_manager;
 mod config_manager_service;
@@ -94,8 +94,11 @@ mod connection_cleanup;
 mod connection_rpc_gate;
 mod current_time;
 mod dynamic_tools;
+mod effective_plugin_change;
 mod error_code;
 mod extensions;
+mod external_agent_migration;
+mod external_auth;
 mod filters;
 mod fs_watch;
 mod fuzzy_file_search;
@@ -298,6 +301,12 @@ fn config_error_location(err: &std::io::Error) -> Option<(String, AppTextRange)>
         })
 }
 
+fn is_unrecoverable_windows_network_config_error(err: &std::io::Error) -> bool {
+    err.get_ref()
+        .and_then(|source| source.downcast_ref::<ConstraintError>())
+        .is_some_and(ConstraintError::is_windows_network_configuration_error)
+}
+
 fn exec_policy_warning_location(err: &ExecPolicyError) -> (Option<String>, Option<AppTextRange>) {
     match err {
         ExecPolicyError::ParsePolicy { path, source } => {
@@ -317,6 +326,16 @@ fn exec_policy_warning_location(err: &ExecPolicyError) -> (Option<String>, Optio
             (Some(path.clone()), None)
         }
         _ => (None, None),
+    }
+}
+
+fn exec_policy_config_warning(err: &ExecPolicyError) -> ConfigWarningNotification {
+    let (path, range) = exec_policy_warning_location(err);
+    ConfigWarningNotification {
+        summary: "Error parsing rules; custom rules not applied.".to_string(),
+        details: Some(err.to_string()),
+        path,
+        range,
     }
 }
 
@@ -485,7 +504,7 @@ pub async fn run_main_with_transport_options(
         Arc::new(NoopThreadConfigLoader),
     );
     match config_manager
-        .load_latest_config(/*fallback_cwd*/ None)
+        .load_config_for_cloud_config_bootstrap()
         .await
     {
         Ok(config) => {
@@ -505,27 +524,24 @@ pub async fn run_main_with_transport_options(
         }
     };
     let mut config_warnings = Vec::new();
-    let (mut config, should_run_personality_migration) = match config_manager
+    let config = match config_manager
         .load_latest_config(/*fallback_cwd*/ None)
         .await
     {
-        Ok(config) => (config, true),
+        Ok(config) => config,
         Err(err) => {
-            if strict_config {
+            if strict_config || is_unrecoverable_windows_network_config_error(&err) {
                 return Err(err);
             }
 
             let message = config_warning_from_error("Invalid configuration; using defaults.", &err);
             config_warnings.push(message);
-            (
-                config_manager.load_default_config().await.map_err(|e| {
-                    std::io::Error::new(
-                        ErrorKind::InvalidData,
-                        format!("error loading default config after config error: {e}"),
-                    )
-                })?,
-                false,
-            )
+            config_manager.load_default_config().await.map_err(|e| {
+                std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!("error loading default config after config error: {e}"),
+                )
+            })?
         }
     };
 
@@ -571,55 +587,8 @@ pub async fn run_main_with_transport_options(
         });
     }
 
-    if should_run_personality_migration {
-        let effective_toml = config.config_layer_stack.effective_config();
-        match effective_toml.try_into() {
-            Ok(config_toml) => {
-                match codex_core::personality_migration::maybe_migrate_personality(
-                    &config.codex_home,
-                    &config_toml,
-                    state_db.clone(),
-                )
-                .await
-                {
-                    Ok(codex_core::personality_migration::PersonalityMigrationStatus::Applied) => {
-                        config = config_manager
-                            .load_latest_config(/*fallback_cwd*/ None)
-                            .await
-                            .map_err(|err| {
-                                std::io::Error::new(
-                                    ErrorKind::InvalidData,
-                                    format!(
-                                        "error reloading config after personality migration: {err}"
-                                    ),
-                                )
-                            })?;
-                    }
-                    Ok(
-                        codex_core::personality_migration::PersonalityMigrationStatus::SkippedMarker
-                        | codex_core::personality_migration::PersonalityMigrationStatus::SkippedExplicitPersonality
-                        | codex_core::personality_migration::PersonalityMigrationStatus::SkippedNoSessions,
-                    ) => {}
-                    Err(err) => {
-                        warn!(error = %err, "Failed to run personality migration");
-                    }
-                }
-            }
-            Err(err) => {
-                warn!(error = %err, "Failed to deserialize config for personality migration");
-            }
-        }
-    }
-
     if let Ok(Some(err)) = check_execpolicy_for_warnings(&config.config_layer_stack).await {
-        let (path, range) = exec_policy_warning_location(&err);
-        let message = ConfigWarningNotification {
-            summary: "Error parsing rules; custom rules not applied.".to_string(),
-            details: Some(err.to_string()),
-            path,
-            range,
-        };
-        config_warnings.push(message);
+        config_warnings.push(exec_policy_config_warning(&err));
     }
 
     if let Some(warning) = project_config_warning(&config) {
@@ -912,7 +881,7 @@ pub async fn run_main_with_transport_options(
         async move {
             let mut listen_for_threads = true;
             let mut shutdown_state = ShutdownState::default();
-            loop {
+            let exit_reason = loop {
                 let running_turn_count = {
                     let running_turn_count = running_turn_count_rx.borrow();
                     *running_turn_count
@@ -925,7 +894,7 @@ pub async fn run_main_with_transport_options(
                     let _ = outbound_control_tx
                         .send(OutboundControlEvent::DisconnectAll)
                         .await;
-                    break;
+                    break "shutdown_requested";
                 }
 
                 tokio::select! {
@@ -947,7 +916,7 @@ pub async fn run_main_with_transport_options(
                     }
                     event = transport_event_rx.recv() => {
                         let Some(event) = event else {
-                            break;
+                            break "transport_channel_closed";
                         };
                         match event {
                             TransportEvent::ConnectionOpened {
@@ -977,7 +946,7 @@ pub async fn run_main_with_transport_options(
                                     .await
                                     .is_err()
                                 {
-                                    break;
+                                    break "outbound_router_closed";
                                 }
                                 connections.insert(
                                     connection_id,
@@ -1005,10 +974,10 @@ pub async fn run_main_with_transport_options(
                                         .await;
                                 });
                                 if !outbound_closed {
-                                    break;
+                                    break "outbound_router_closed";
                                 }
                                 if shutdown_when_no_connections && connections.is_empty() {
-                                    break;
+                                    break "last_connection_closed";
                                 }
                             }
                             TransportEvent::IncomingMessage { connection_id, message } => {
@@ -1147,7 +1116,7 @@ pub async fn run_main_with_transport_options(
                         }
                     }
                 }
-            }
+            };
 
             if !shutdown_state.forced() {
                 futures::future::join_all(
@@ -1162,7 +1131,12 @@ pub async fn run_main_with_transport_options(
             } else {
                 connection_cleanup_tasks.abort();
             }
-            info!("processor task exited (channel closed)");
+            info!(
+                exit_reason,
+                remaining_connection_count = connections.len(),
+                shutdown_forced = shutdown_state.forced(),
+                "processor task exited"
+            );
         }
     });
 
@@ -1356,13 +1330,62 @@ fn analytics_rpc_transport(transport: &AppServerTransport) -> AppServerRpcTransp
 #[cfg(test)]
 mod tests {
     use super::LogFormat;
+    #[cfg(target_os = "windows")]
+    use super::is_unrecoverable_windows_network_config_error;
     #[cfg(debug_assertions)]
     use super::loader_overrides_with_test_user_config_file;
+    #[cfg(target_os = "windows")]
+    use crate::config_manager::ConfigManager;
     #[cfg(debug_assertions)]
     use codex_config::LoaderOverrides;
     #[cfg(debug_assertions)]
     use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn cloud_config_bootstrap_defers_network_validation_and_preserves_cli_overrides() {
+        let codex_home = tempfile::tempdir().expect("create Codex home");
+        std::fs::write(
+            codex_home.path().join(codex_config::CONFIG_TOML_FILE),
+            r#"
+sandbox_mode = "workspace-write"
+
+[sandbox_workspace_write]
+network_access = true
+
+[features]
+network_proxy = true
+
+[windows]
+sandbox = "elevated"
+"#,
+        )
+        .expect("write config");
+        let chatgpt_base_url = "https://cloud-config.example.test".to_string();
+        let config_manager = ConfigManager::new_for_tests(
+            codex_home.path().to_path_buf(),
+            vec![(
+                "chatgpt_base_url".to_string(),
+                toml::Value::String(chatgpt_base_url.clone()),
+            )],
+            codex_config::LoaderOverrides::without_managed_config_for_tests(),
+            codex_config::CloudConfigBundleLoader::default(),
+        );
+
+        let config = config_manager
+            .load_config_for_cloud_config_bootstrap()
+            .await
+            .expect("bootstrap config should defer Windows network validation");
+        assert_eq!(config.chatgpt_base_url, chatgpt_base_url);
+        assert!(config.permissions.network.is_some());
+
+        let err = config_manager
+            .load_latest_config(/*fallback_cwd*/ None)
+            .await
+            .expect_err("authoritative config should enforce Windows network validation");
+        assert!(is_unrecoverable_windows_network_config_error(&err));
+    }
 
     #[test]
     fn log_format_from_env_value_matches_json_values_case_insensitively() {

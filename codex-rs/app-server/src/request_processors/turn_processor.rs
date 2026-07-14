@@ -1,6 +1,7 @@
 use super::*;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputContentItem;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AdditionalContextEntry as CoreAdditionalContextEntry;
 use codex_protocol::protocol::AdditionalContextKind as CoreAdditionalContextKind;
 use codex_protocol::protocol::MultiAgentVersion;
@@ -107,7 +108,6 @@ fn map_additional_context(
 struct ThreadSettingsBuildParams {
     method: &'static str,
     environments: Option<TurnEnvironmentSelections>,
-    runtime_workspace_roots: Option<Vec<AbsolutePathBuf>>,
     approval_policy: Option<codex_app_server_protocol::AskForApproval>,
     approvals_reviewer: Option<codex_app_server_protocol::ApprovalsReviewer>,
     sandbox_policy: Option<codex_app_server_protocol::SandboxPolicy>,
@@ -481,6 +481,9 @@ impl TurnRequestProcessor {
                 ))
             })?;
 
+        let runtime_workspace_roots = params
+            .runtime_workspace_roots
+            .map(resolve_runtime_workspace_roots);
         let environment_selections =
             resolve_turn_environment_selections(self.thread_manager.as_ref(), params.environments)?;
 
@@ -495,7 +498,12 @@ impl TurnRequestProcessor {
         let turn_has_input = !mapped_items.is_empty();
         let cwd = resolve_request_cwd(params.cwd)?;
         let environments = self
-            .build_environment_override(thread.as_ref(), cwd, environment_selections)
+            .build_environment_override(
+                thread.as_ref(),
+                cwd,
+                runtime_workspace_roots,
+                environment_selections,
+            )
             .await;
         let thread_settings = self
             .build_thread_settings_overrides(
@@ -503,7 +511,6 @@ impl TurnRequestProcessor {
                 ThreadSettingsBuildParams {
                     method: "turn/start",
                     environments,
-                    runtime_workspace_roots: params.runtime_workspace_roots,
                     approval_policy: params.approval_policy,
                     approvals_reviewer: params.approvals_reviewer,
                     sandbox_policy: params.sandbox_policy,
@@ -517,6 +524,13 @@ impl TurnRequestProcessor {
                 },
             )
             .await?;
+        let parent_permission_profile_override =
+            thread_settings.permission_profile.clone().or_else(|| {
+                thread_settings
+                    .sandbox_policy
+                    .as_ref()
+                    .map(PermissionProfile::from_legacy_sandbox_policy)
+            });
 
         // Start the turn by submitting the user input. Return its submission id as turn_id.
         let turn_op = Op::UserInput {
@@ -541,12 +555,15 @@ impl TurnRequestProcessor {
 
         if turn_has_input {
             let config_snapshot = thread.config_snapshot().await;
+            let parent_permission_profile =
+                parent_permission_profile_override.unwrap_or(config_snapshot.permission_profile);
             codex_memories_write::start_memories_startup_task(
                 Arc::clone(&self.thread_manager),
                 Arc::clone(&self.auth_manager),
                 thread_id,
                 Arc::clone(&thread),
                 thread.config().await,
+                parent_permission_profile,
                 &config_snapshot.session_source,
             );
         }
@@ -572,33 +589,63 @@ impl TurnRequestProcessor {
         &self,
         thread: &CodexThread,
         cwd: Option<AbsolutePathBuf>,
+        workspace_roots: Option<Vec<AbsolutePathBuf>>,
         environment_selections: Option<Vec<TurnEnvironmentSelection>>,
     ) -> Option<TurnEnvironmentSelections> {
-        match (cwd, environment_selections) {
-            (None, None) => None,
-            (Some(cwd), None) => {
-                let environment_selections =
-                    self.thread_manager.default_environment_selections(&cwd);
-                Some(TurnEnvironmentSelections::new(cwd, environment_selections))
-            }
-            (cwd, Some(environment_selections)) => {
-                let legacy_fallback_cwd = match cwd {
-                    Some(cwd) => cwd,
-                    None => {
-                        let snapshot = thread.config_snapshot().await;
-                        environment_selections
-                            .iter()
-                            .find(|selection| selection.environment_id == LOCAL_ENVIRONMENT_ID)
-                            .and_then(|selection| selection.cwd.to_abs_path().ok())
-                            .unwrap_or_else(|| snapshot.cwd().clone())
-                    }
-                };
-                Some(TurnEnvironmentSelections::new(
-                    legacy_fallback_cwd,
-                    environment_selections,
-                ))
-            }
+        if cwd.is_none() && workspace_roots.is_none() && environment_selections.is_none() {
+            return None;
         }
+
+        // Explicit environment selections own their roots and pass through unchanged. Top-level
+        // `runtimeWorkspaceRoots` is only a compatibility input for default environments.
+        if let Some(environment_selections) = environment_selections {
+            let legacy_fallback_cwd = match cwd {
+                Some(cwd) => cwd,
+                None => match environment_selections
+                    .iter()
+                    .find(|selection| selection.environment_id == LOCAL_ENVIRONMENT_ID)
+                    .and_then(|selection| selection.cwd.to_abs_path().ok())
+                {
+                    Some(cwd) => cwd,
+                    None => thread.config_snapshot().await.cwd().clone(),
+                },
+            };
+            return Some(TurnEnvironmentSelections::new(
+                legacy_fallback_cwd,
+                environment_selections,
+            ));
+        }
+
+        let snapshot = thread.config_snapshot().await;
+        let current_cwd = snapshot.cwd().clone();
+        let legacy_fallback_cwd = cwd.unwrap_or_else(|| current_cwd.clone());
+        let workspace_roots = match workspace_roots {
+            Some(workspace_roots) => workspace_roots,
+            None => {
+                // Match the pre-environment partial-update behavior: a cwd-only update retargets
+                // the old cwd root while preserving any additional roots. Deduplicate because the
+                // new cwd may already be present as an additional root.
+                let mut retargeted_workspace_roots = Vec::new();
+                for root in snapshot.workspace_roots {
+                    let root = if root == current_cwd {
+                        legacy_fallback_cwd.clone()
+                    } else {
+                        root
+                    };
+                    if !retargeted_workspace_roots.contains(&root) {
+                        retargeted_workspace_roots.push(root);
+                    }
+                }
+                retargeted_workspace_roots
+            }
+        };
+        let environment_selections = self
+            .thread_manager
+            .default_environment_selections(&legacy_fallback_cwd, &workspace_roots);
+        Some(TurnEnvironmentSelections::new(
+            legacy_fallback_cwd,
+            environment_selections,
+        ))
     }
 
     async fn build_thread_settings_overrides(
@@ -609,7 +656,6 @@ impl TurnRequestProcessor {
         let ThreadSettingsBuildParams {
             method,
             environments,
-            runtime_workspace_roots,
             approval_policy,
             approvals_reviewer,
             sandbox_policy,
@@ -630,7 +676,6 @@ impl TurnRequestProcessor {
 
         let collaboration_mode =
             collaboration_mode.map(|mode| self.normalize_collaboration_mode(mode));
-        let runtime_workspace_roots_request = runtime_workspace_roots;
         let has_environment_override = environments.is_some();
         // `thread/settings/update` only acknowledges that the update was queued.
         // Clients that send dependent partial updates should wait for
@@ -642,7 +687,6 @@ impl TurnRequestProcessor {
         };
 
         let has_any_overrides = has_environment_override
-            || runtime_workspace_roots_request.is_some()
             || approval_policy.is_some()
             || approvals_reviewer.is_some()
             || sandbox_policy.is_some()
@@ -654,8 +698,6 @@ impl TurnRequestProcessor {
             || collaboration_mode.is_some()
             || personality.is_some();
 
-        let runtime_workspace_roots =
-            runtime_workspace_roots_request.map(resolve_runtime_workspace_roots);
         let approval_policy =
             approval_policy.map(codex_app_server_protocol::AskForApproval::to_core);
         let approvals_reviewer =
@@ -672,11 +714,6 @@ impl TurnRequestProcessor {
                     cwd: environments
                         .as_ref()
                         .map(|environments| environments.legacy_fallback_cwd.to_path_buf()),
-                    workspace_roots: Some(
-                        runtime_workspace_roots
-                            .clone()
-                            .unwrap_or_else(|| snapshot.workspace_roots.clone()),
-                    ),
                     default_permissions: Some(permissions),
                     codex_linux_sandbox_exe: self.arg0_paths.codex_linux_sandbox_exe.clone(),
                     main_execve_wrapper_exe: self.arg0_paths.main_execve_wrapper_exe.clone(),
@@ -715,7 +752,6 @@ impl TurnRequestProcessor {
             thread
                 .preview_thread_settings_overrides(CodexThreadSettingsOverrides {
                     environments: environments.clone(),
-                    workspace_roots: runtime_workspace_roots.clone(),
                     approval_policy,
                     approvals_reviewer,
                     sandbox_policy: sandbox_policy.clone(),
@@ -738,7 +774,6 @@ impl TurnRequestProcessor {
 
         Ok(codex_protocol::protocol::ThreadSettingsOverrides {
             environments,
-            workspace_roots: runtime_workspace_roots,
             profile_workspace_roots,
             approval_policy,
             approvals_reviewer,
@@ -763,7 +798,12 @@ impl TurnRequestProcessor {
         let (_, thread) = self.load_thread(&params.thread_id).await?;
         let cwd = resolve_request_cwd(params.cwd)?;
         let environments = self
-            .build_environment_override(thread.as_ref(), cwd, /*environment_selections*/ None)
+            .build_environment_override(
+                thread.as_ref(),
+                cwd,
+                /*workspace_roots*/ None,
+                /*environment_selections*/ None,
+            )
             .await;
         let thread_settings = self
             .build_thread_settings_overrides(
@@ -771,7 +811,6 @@ impl TurnRequestProcessor {
                 ThreadSettingsBuildParams {
                     method: "thread/settings/update",
                     environments,
-                    runtime_workspace_roots: None,
                     approval_policy: params.approval_policy,
                     approvals_reviewer: params.approvals_reviewer,
                     sandbox_policy: params.sandbox_policy,
@@ -1002,6 +1041,9 @@ impl TurnRequestProcessor {
             thread.as_ref(),
             Op::RealtimeConversationStart(ConversationStartParams {
                 client_managed_handoffs: params.client_managed_handoffs.unwrap_or(false),
+                flush_transcript_tail_on_session_end: params
+                    .flush_transcript_tail_on_session_end
+                    .unwrap_or(false),
                 codex_responses_as_items: params.codex_responses_as_items.unwrap_or(false),
                 codex_response_item_prefix: params.codex_response_item_prefix,
                 codex_response_handoff_prefix: params.codex_response_handoff_prefix,

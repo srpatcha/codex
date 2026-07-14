@@ -10,6 +10,7 @@ use crate::tasks::InterruptedTurnHistoryMarker;
 use crate::tasks::interrupted_turn_history_marker;
 use codex_extension_api::empty_extension_registry;
 use codex_models_manager::manager::RefreshStrategy;
+use codex_protocol::ResponseItemId;
 use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::models::ContentItem;
@@ -169,7 +170,7 @@ fn truncates_before_requested_user_message() {
         user_msg("u2"),
         assistant_msg("a3"),
         ResponseItem::Reasoning {
-            id: Some("r1".to_string()),
+            id: Some(ResponseItemId::with_suffix("rs", "1")),
             summary: vec![ReasoningItemReasoningSummary::SummaryText {
                 text: "s".to_string(),
             }],
@@ -199,6 +200,7 @@ fn truncates_before_requested_user_message() {
         &SnapshotTurnState {
             ends_mid_turn: false,
             active_turn_id: None,
+            active_turn_started_at: None,
             active_turn_start_index: None,
         },
     );
@@ -224,6 +226,7 @@ fn truncates_before_requested_user_message() {
         &SnapshotTurnState {
             ends_mid_turn: false,
             active_turn_id: None,
+            active_turn_started_at: None,
             active_turn_start_index: None,
         },
     );
@@ -248,6 +251,7 @@ fn out_of_range_truncation_drops_only_unfinished_suffix_mid_turn() {
         &SnapshotTurnState {
             ends_mid_turn: true,
             active_turn_id: None,
+            active_turn_started_at: None,
             active_turn_start_index: None,
         },
     );
@@ -299,6 +303,7 @@ fn out_of_range_truncation_drops_pre_user_active_turn_prefix() {
         SnapshotTurnState {
             ends_mid_turn: true,
             active_turn_id: Some("turn-2".to_string()),
+            active_turn_started_at: None,
             active_turn_start_index: Some(2),
         },
     );
@@ -340,6 +345,7 @@ async fn ignores_session_prefix_messages_when_truncating() {
         &SnapshotTurnState {
             ends_mid_turn: false,
             active_turn_id: None,
+            active_turn_started_at: None,
             active_turn_start_index: None,
         },
     );
@@ -553,6 +559,7 @@ async fn start_thread_seeds_extension_data_for_mcp_and_lifecycle_contributors() 
                 let mut server = codex_mcp::codex_apps_mcp_server_config(
                     "https://selected.invalid",
                     /*apps_mcp_product_sku*/ None,
+                    /*originator*/ None,
                 );
                 let CapabilityRootLocation::Environment { environment_id, .. } =
                     &selected_root.location;
@@ -574,6 +581,10 @@ async fn start_thread_seeds_extension_data_for_mcp_and_lifecycle_contributors() 
     let mut config = test_config().await;
     config.codex_home = temp_dir.path().join("codex-home").abs();
     config.cwd = config.codex_home.abs();
+    config
+        .features
+        .enable(Feature::Apps)
+        .expect("test config should allow apps");
     std::fs::create_dir_all(&config.codex_home).expect("create codex home");
 
     let lifecycle_observed = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -585,9 +596,13 @@ async fn start_thread_seeds_extension_data_for_mcp_and_lifecycle_contributors() 
     let mut extensions = codex_extension_api::ExtensionRegistryBuilder::new();
     extensions.thread_lifecycle_contributor(recorder.clone());
     extensions.mcp_server_contributor(recorder);
+    let auth_manager =
+        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
     let manager = ThreadManager::new(
         &config,
-        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing()),
+        auth_manager.clone(),
+        build_models_manager(&config, auth_manager),
+        crate::CodexAppsToolsCache::default(),
         SessionSource::Exec,
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
         Arc::new(extensions.build()),
@@ -620,7 +635,7 @@ async fn start_thread_seeds_extension_data_for_mcp_and_lifecycle_contributors() 
             session_source: None,
             thread_source: None,
             dynamic_tools: Vec::new(),
-            metrics_service_name: None,
+            metrics_service_name: Some("codex_work_desktop".to_string()),
             parent_trace: None,
             environments: Vec::new(),
             thread_extension_init: selected_root_init("selected-a", "env-a"),
@@ -646,6 +661,7 @@ async fn start_thread_seeds_extension_data_for_mcp_and_lifecycle_contributors() 
         .await
         .expect("start second thread");
     let first_session = &first_thread.thread.codex.session;
+    let first_originator = first_session.originator().await;
     let first_resolved = first_session
         .services
         .mcp_manager
@@ -653,10 +669,12 @@ async fn start_thread_seeds_extension_data_for_mcp_and_lifecycle_contributors() 
             &config,
             &first_session.services.mcp_thread_init,
             &first_session.services.thread_extension_data,
+            &first_originator,
             /*available_environment_ids*/ &[],
         )
         .await;
     let second_session = &second_thread.thread.codex.session;
+    let second_originator = second_session.originator().await;
     let second_resolved = second_session
         .services
         .mcp_manager
@@ -664,6 +682,7 @@ async fn start_thread_seeds_extension_data_for_mcp_and_lifecycle_contributors() 
             &config,
             &second_session.services.mcp_thread_init,
             &second_session.services.thread_extension_data,
+            &second_originator,
             /*available_environment_ids*/ &[],
         )
         .await;
@@ -699,12 +718,27 @@ async fn start_thread_seeds_extension_data_for_mcp_and_lifecycle_contributors() 
             .collect::<std::collections::BTreeMap<_, _>>()
     };
     assert_eq!(
-        selected_servers(&first_resolved),
+        selected_servers(&first_resolved.config),
         std::collections::BTreeMap::from([("selected-a".to_string(), "env-a".to_string())])
     );
     assert_eq!(
-        selected_servers(&second_resolved),
+        selected_servers(&second_resolved.config),
         std::collections::BTreeMap::from([("selected-b".to_string(), "env-b".to_string())])
+    );
+    let codex_apps_server = codex_mcp::configured_mcp_servers(&first_resolved.config)
+        .remove(codex_mcp::CODEX_APPS_MCP_SERVER_NAME)
+        .expect("Codex Apps server should be configured");
+    let codex_apps_headers = match codex_apps_server.transport {
+        codex_config::McpServerTransportConfig::StreamableHttp { http_headers, .. } => http_headers,
+        codex_config::McpServerTransportConfig::Stdio { .. } => {
+            panic!("Codex Apps server should use streamable HTTP")
+        }
+    };
+    assert_eq!(
+        codex_apps_headers
+            .expect("Codex Apps headers should be configured")
+            .get("originator"),
+        Some(&"codex_work_desktop".to_string())
     );
 }
 
@@ -788,6 +822,8 @@ async fn resume_and_fork_do_not_restore_thread_environments_from_rollout() {
     let manager = ThreadManager::new(
         &config,
         auth_manager.clone(),
+        build_models_manager(&config, auth_manager.clone()),
+        crate::CodexAppsToolsCache::default(),
         SessionSource::Exec,
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
         empty_extension_registry(),
@@ -805,6 +841,7 @@ async fn resume_and_fork_do_not_restore_thread_environments_from_rollout() {
     let environments = vec![TurnEnvironmentSelection {
         environment_id: "local".to_string(),
         cwd: PathUri::from_abs_path(&selected_cwd),
+        workspace_roots: Vec::new(),
     }];
     let default_cwd = config.cwd.clone();
     let mut source_config = config.clone();
@@ -913,7 +950,9 @@ async fn explicit_installation_id_skips_codex_home_file() {
     let thread_store = thread_store_from_config(&config, state_db.clone());
     let manager = ThreadManager::new(
         &config,
-        auth_manager,
+        auth_manager.clone(),
+        build_models_manager(&config, auth_manager),
+        crate::CodexAppsToolsCache::default(),
         SessionSource::Exec,
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
         empty_extension_registry(),
@@ -955,6 +994,8 @@ async fn resume_active_thread_from_rollout_returns_running_thread() {
     let manager = ThreadManager::new(
         &config,
         auth_manager.clone(),
+        build_models_manager(&config, auth_manager.clone()),
+        crate::CodexAppsToolsCache::default(),
         SessionSource::Exec,
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
         empty_extension_registry(),
@@ -1015,6 +1056,8 @@ async fn resume_stopped_thread_from_rollout_spawns_new_thread() {
     let manager = ThreadManager::new(
         &config,
         auth_manager.clone(),
+        build_models_manager(&config, auth_manager.clone()),
+        crate::CodexAppsToolsCache::default(),
         SessionSource::Exec,
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
         empty_extension_registry(),
@@ -1082,6 +1125,8 @@ async fn resume_stopped_thread_from_rollout_preserves_thread_source() {
     let manager = ThreadManager::new(
         &config,
         auth_manager.clone(),
+        build_models_manager(&config, auth_manager.clone()),
+        crate::CodexAppsToolsCache::default(),
         SessionSource::Exec,
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
         empty_extension_registry(),
@@ -1173,7 +1218,9 @@ async fn subtree_listing_uses_injected_graph_store_without_state_db() {
         AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
     let manager = ThreadManager::new(
         &config,
-        auth_manager,
+        auth_manager.clone(),
+        build_models_manager(&config, auth_manager),
+        crate::CodexAppsToolsCache::default(),
         SessionSource::Exec,
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
         empty_extension_registry(),
@@ -1219,6 +1266,8 @@ async fn rollout_path_resume_and_fork_read_history_through_thread_store() {
     let manager = ThreadManager::new(
         &config,
         auth_manager.clone(),
+        build_models_manager(&config, auth_manager.clone()),
+        crate::CodexAppsToolsCache::default(),
         SessionSource::Exec,
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
         empty_extension_registry(),
@@ -1323,7 +1372,9 @@ async fn new_uses_active_provider_for_model_refresh() {
         AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
     let manager = ThreadManager::new(
         &config,
-        auth_manager,
+        auth_manager.clone(),
+        build_models_manager(&config, auth_manager),
+        crate::CodexAppsToolsCache::default(),
         SessionSource::Exec,
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
         empty_extension_registry(),
@@ -1336,8 +1387,69 @@ async fn new_uses_active_provider_for_model_refresh() {
         /*external_time_provider*/ None,
     );
 
-    let _ = manager.list_models(RefreshStrategy::Online).await;
+    let _ = manager
+        .list_models(
+            RefreshStrategy::Online,
+            crate::test_support::default_http_client_factory(),
+        )
+        .await;
     assert_eq!(models_mock.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn injected_models_manager_controls_refresh_policy() {
+    let server = MockServer::start().await;
+    let _ = mount_models_once(&server, ModelsResponse { models: vec![] }).await;
+    let _ = mount_models_once(&server, ModelsResponse { models: vec![] }).await;
+
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+    config.model_catalog = None;
+    config.model_provider.base_url = Some(server.uri());
+
+    let auth_manager =
+        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+    let provider = create_model_provider(
+        config.model_provider.clone(),
+        Some(Arc::clone(&auth_manager)),
+    );
+    let models_manager = provider.models_manager_without_cache(config.model_catalog.clone());
+    let manager = ThreadManager::new(
+        &config,
+        auth_manager,
+        models_manager,
+        crate::CodexAppsToolsCache::default(),
+        SessionSource::Custom("test-embedder".to_string()),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        empty_extension_registry(),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+        /*analytics_events_client*/ None,
+        thread_store_from_config(&config, /*state_db*/ None),
+        /*agent_graph_store*/ None,
+        TEST_INSTALLATION_ID.to_string(),
+        /*attestation_provider*/ None,
+        /*external_time_provider*/ None,
+    );
+
+    let http_client_factory = crate::test_support::default_http_client_factory();
+    let _ = manager
+        .list_models(
+            RefreshStrategy::OnlineIfUncached,
+            http_client_factory.clone(),
+        )
+        .await;
+    let _ = manager
+        .list_models(RefreshStrategy::OnlineIfUncached, http_client_factory)
+        .await;
+
+    assert_eq!(
+        server.received_requests().await.unwrap_or_default().len(),
+        2
+    );
+    assert!(!config.codex_home.join("models_cache.json").exists());
 }
 
 #[test]
@@ -1350,6 +1462,7 @@ fn interrupted_fork_snapshot_appends_interrupt_boundary() {
             append_interrupted_boundary(
                 committed_history,
                 /*turn_id*/ None,
+                /*started_at*/ None,
                 InterruptedTurnHistoryMarker::ContextualUser,
             )
             .get_rollout_items()
@@ -1360,6 +1473,7 @@ fn interrupted_fork_snapshot_appends_interrupt_boundary() {
             RolloutItem::ResponseItem(contextual_user_interrupted_marker()),
             RolloutItem::EventMsg(EventMsg::TurnAborted(TurnAbortedEvent {
                 turn_id: None,
+                started_at: None,
                 reason: TurnAbortReason::Interrupted,
                 completed_at: None,
                 duration_ms: None,
@@ -1372,6 +1486,7 @@ fn interrupted_fork_snapshot_appends_interrupt_boundary() {
             append_interrupted_boundary(
                 InitialHistory::New,
                 /*turn_id*/ None,
+                /*started_at*/ None,
                 InterruptedTurnHistoryMarker::ContextualUser,
             )
             .get_rollout_items()
@@ -1381,6 +1496,7 @@ fn interrupted_fork_snapshot_appends_interrupt_boundary() {
             RolloutItem::ResponseItem(contextual_user_interrupted_marker()),
             RolloutItem::EventMsg(EventMsg::TurnAborted(TurnAbortedEvent {
                 turn_id: None,
+                started_at: None,
                 reason: TurnAbortReason::Interrupted,
                 completed_at: None,
                 duration_ms: None,
@@ -1400,6 +1516,7 @@ fn disabled_interrupted_fork_snapshot_appends_only_interrupt_event() {
             append_interrupted_boundary(
                 committed_history,
                 /*turn_id*/ None,
+                /*started_at*/ None,
                 InterruptedTurnHistoryMarker::Disabled,
             )
             .get_rollout_items()
@@ -1409,6 +1526,7 @@ fn disabled_interrupted_fork_snapshot_appends_only_interrupt_event() {
             RolloutItem::ResponseItem(user_msg("hello")),
             RolloutItem::EventMsg(EventMsg::TurnAborted(TurnAbortedEvent {
                 turn_id: None,
+                started_at: None,
                 reason: TurnAbortReason::Interrupted,
                 completed_at: None,
                 duration_ms: None,
@@ -1421,6 +1539,7 @@ fn disabled_interrupted_fork_snapshot_appends_only_interrupt_event() {
             append_interrupted_boundary(
                 InitialHistory::New,
                 /*turn_id*/ None,
+                /*started_at*/ None,
                 InterruptedTurnHistoryMarker::Disabled,
             )
             .get_rollout_items()
@@ -1429,6 +1548,7 @@ fn disabled_interrupted_fork_snapshot_appends_only_interrupt_event() {
         serde_json::to_value(vec![RolloutItem::EventMsg(EventMsg::TurnAborted(
             TurnAbortedEvent {
                 turn_id: None,
+                started_at: None,
                 reason: TurnAbortReason::Interrupted,
                 completed_at: None,
                 duration_ms: None,
@@ -1446,6 +1566,7 @@ fn interrupted_snapshot_is_not_mid_turn() {
         RolloutItem::ResponseItem(contextual_user_interrupted_marker()),
         RolloutItem::EventMsg(EventMsg::TurnAborted(TurnAbortedEvent {
             turn_id: Some("turn-1".to_string()),
+            started_at: None,
             reason: TurnAbortReason::Interrupted,
             completed_at: None,
             duration_ms: None,
@@ -1457,6 +1578,7 @@ fn interrupted_snapshot_is_not_mid_turn() {
         SnapshotTurnState {
             ends_mid_turn: false,
             active_turn_id: None,
+            active_turn_started_at: None,
             active_turn_start_index: None,
         },
     );
@@ -1503,6 +1625,7 @@ fn completed_legacy_event_history_is_not_mid_turn() {
         SnapshotTurnState {
             ends_mid_turn: false,
             active_turn_id: None,
+            active_turn_started_at: None,
             active_turn_start_index: None,
         },
     );
@@ -1527,6 +1650,7 @@ fn mixed_response_and_legacy_user_event_history_is_mid_turn() {
         SnapshotTurnState {
             ends_mid_turn: true,
             active_turn_id: None,
+            active_turn_started_at: None,
             active_turn_start_index: None,
         },
     );
@@ -1546,6 +1670,8 @@ async fn interrupted_fork_snapshot_does_not_synthesize_turn_id_for_legacy_histor
     let manager = ThreadManager::new(
         &config,
         auth_manager.clone(),
+        build_models_manager(&config, auth_manager.clone()),
+        crate::CodexAppsToolsCache::default(),
         SessionSource::Exec,
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
         empty_extension_registry(),
@@ -1613,6 +1739,7 @@ async fn interrupted_fork_snapshot_does_not_synthesize_turn_id_for_legacy_histor
     let interrupted_abort_json = serde_json::to_value(RolloutItem::EventMsg(
         EventMsg::TurnAborted(TurnAbortedEvent {
             turn_id: expected_turn_id,
+            started_at: None,
             reason: TurnAbortReason::Interrupted,
             completed_at: None,
             duration_ms: None,
@@ -1655,6 +1782,8 @@ async fn interrupted_fork_snapshot_preserves_explicit_turn_id() {
     let manager = ThreadManager::new(
         &config,
         auth_manager.clone(),
+        build_models_manager(&config, auth_manager.clone()),
+        crate::CodexAppsToolsCache::default(),
         SessionSource::Exec,
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
         empty_extension_registry(),
@@ -1700,6 +1829,7 @@ async fn interrupted_fork_snapshot_preserves_explicit_turn_id() {
         SnapshotTurnState {
             ends_mid_turn: true,
             active_turn_id: Some("turn-explicit".to_string()),
+            active_turn_started_at: None,
             active_turn_start_index: Some(1),
         },
     );
@@ -1732,6 +1862,7 @@ async fn interrupted_fork_snapshot_preserves_explicit_turn_id() {
             item,
             RolloutItem::EventMsg(EventMsg::TurnAborted(TurnAbortedEvent {
                 turn_id: Some(turn_id),
+                started_at: None,
                 reason: TurnAbortReason::Interrupted,
             completed_at: None,
             duration_ms: None,
@@ -1754,6 +1885,8 @@ async fn interrupted_fork_snapshot_uses_persisted_mid_turn_history_without_live_
     let manager = ThreadManager::new(
         &config,
         auth_manager.clone(),
+        build_models_manager(&config, auth_manager.clone()),
+        crate::CodexAppsToolsCache::default(),
         SessionSource::Exec,
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
         empty_extension_registry(),

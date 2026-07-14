@@ -122,10 +122,6 @@ impl ChatWidget {
         self.refresh_status_surfaces();
     }
 
-    pub(crate) fn set_full_access_warning_acknowledged(&mut self, acknowledged: bool) {
-        self.config.notices.hide_full_access_warning = Some(acknowledged);
-    }
-
     pub(crate) fn set_world_writable_warning_acknowledged(&mut self, acknowledged: bool) {
         self.config.notices.hide_world_writable_warning = Some(acknowledged);
     }
@@ -345,7 +341,6 @@ impl ChatWidget {
         )
     }
 
-    #[allow(dead_code)] // Used in tests
     pub(crate) fn current_collaboration_mode(&self) -> &CollaborationMode {
         &self.current_collaboration_mode
     }

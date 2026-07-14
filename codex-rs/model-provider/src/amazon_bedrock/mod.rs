@@ -69,6 +69,7 @@ impl AmazonBedrockModelProvider {
                 CodexAuth::ApiKey(_)
                 | CodexAuth::Chatgpt(_)
                 | CodexAuth::ChatgptAuthTokens(_)
+                | CodexAuth::Headers(_)
                 | CodexAuth::AgentIdentity(_)
                 | CodexAuth::PersonalAccessToken(_) => None,
             })
@@ -164,6 +165,16 @@ impl ModelProvider for AmazonBedrockModelProvider {
     fn models_manager(
         &self,
         _codex_home: PathBuf,
+        config_model_catalog: Option<ModelsResponse>,
+    ) -> SharedModelsManager {
+        Arc::new(StaticModelsManager::new(
+            /*auth_manager*/ None,
+            config_model_catalog.map_or_else(static_model_catalog, with_default_only_service_tier),
+        ))
+    }
+
+    fn models_manager_without_cache(
+        &self,
         config_model_catalog: Option<ModelsResponse>,
     ) -> SharedModelsManager {
         Arc::new(StaticModelsManager::new(

@@ -589,7 +589,8 @@ async fn view_image_routes_to_selected_remote_environment() -> anyhow::Result<()
     let absolute_image_path = image_path_uri.inferred_native_path_string();
     let remote_selection = TurnEnvironmentSelection {
         environment_id: REMOTE_ENVIRONMENT_ID.to_string(),
-        cwd: remote_cwd_uri,
+        cwd: remote_cwd_uri.clone(),
+        workspace_roots: vec![remote_cwd_uri],
     };
     let relative_call_id = "call-view-image-relative-multi-env";
     let absolute_call_id = "call-view-image-absolute-multi-env";
@@ -673,12 +674,12 @@ async fn view_image_routes_to_selected_remote_environment() -> anyhow::Result<()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn view_image_tool_can_preserve_original_resolution_when_requested_on_gpt5_3_codex()
+async fn view_image_tool_can_preserve_original_resolution_when_requested_on_gpt5_4()
 -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let mut builder = test_codex().with_model("gpt-5.3-codex");
+    let mut builder = test_codex().with_model("gpt-5.4");
     let test = builder.build_with_auto_env(&server).await?;
     let TestCodex {
         codex,
@@ -769,7 +770,7 @@ async fn view_image_tool_errors_clearly_for_unsupported_detail_values() -> anyho
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let mut builder = test_codex().with_model("gpt-5.3-codex");
+    let mut builder = test_codex().with_model("gpt-5.4");
     let test = builder.build_with_auto_env(&server).await?;
     let TestCodex {
         codex,
@@ -847,7 +848,7 @@ async fn view_image_tool_treats_null_detail_as_omitted() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let mut builder = test_codex().with_model("gpt-5.3-codex");
+    let mut builder = test_codex().with_model("gpt-5.4");
     let test = builder.build_with_auto_env(&server).await?;
     let TestCodex {
         codex,
@@ -1031,7 +1032,7 @@ async fn view_image_tool_does_not_force_original_resolution_with_capability_only
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let mut builder = test_codex().with_model("gpt-5.3-codex");
+    let mut builder = test_codex().with_model("gpt-5.4");
     let test = builder.build_with_auto_env(&server).await?;
     let TestCodex {
         codex,
@@ -1374,7 +1375,8 @@ async fn view_image_tool_returns_unsupported_message_for_text_only_model() -> an
         upgrade: None,
         base_instructions: "base instructions".to_string(),
         model_messages: None,
-        supports_reasoning_summaries: false,
+        include_skills_usage_instructions: false,
+        supports_reasoning_summary_parameter: true,
         default_reasoning_summary: ReasoningSummary::Auto,
         support_verbosity: false,
         default_verbosity: None,

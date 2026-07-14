@@ -52,6 +52,7 @@ use codex_config::types::TuiNotificationSettings;
 use codex_config::types::TuiPetAnchor;
 use codex_config::types::UriBasedFileOpener;
 use codex_config::types::WindowsSandboxModeToml;
+use codex_core_plugins::PluginLoadOutcome;
 use codex_core_plugins::PluginsConfigInput;
 use codex_exec_server::ExecutorFileSystem;
 use codex_exec_server::LOCAL_FS;
@@ -69,6 +70,8 @@ use codex_features::MultiAgentV2ConfigToml;
 use codex_features::NetworkProxyConfigToml;
 use codex_features::TokenBudgetConfigToml;
 use codex_git_utils::resolve_root_git_project_for_trust;
+use codex_http_client::HttpClientFactory;
+use codex_http_client::OutboundProxyPolicy;
 use codex_install_context::InstallContext;
 use codex_login::AuthManagerConfig;
 use codex_login::AuthRouteConfig;
@@ -245,6 +248,7 @@ Payload:
 ```
 You may also see them addressed as to=/root/..., which indicates your identity is /root/...
 "#;
+const DEFAULT_MULTI_AGENT_V2_MODEL_OVERRIDE_USAGE_HINT_TEXT: &str = "Full-history forks (`fork_turns` omitted or `\"all\"`) inherit the parent model and reasoning effort and do not accept overrides. Only set `model` or `reasoning_effort` when explicitly requested by the user, applicable `AGENTS.md` instructions, or skill instructions; when doing so, set `fork_turns` to `\"none\"` or a positive integer string.";
 const DEFAULT_MULTI_AGENT_V2_TOOL_NAMESPACE: &str = "collaboration";
 const DEFAULT_MULTI_AGENT_V2_SHARED_USAGE_HINT_TEXT: &str = r#"Note that collaboration tools cannot be called from inside `functions.exec`. Call `spawn_agent`, `send_message`, `followup_task`, `wait_agent`, `interrupt_agent`, and `list_agents` only as direct tool calls using the recipient shown in their tool definitions, such as `to=functions.collaboration.spawn_agent`, since they are intentionally absent from the `functions.exec` `tools.*` namespace. Available tools in `functions.exec` are explicitly described with a `tools` namespace in the developer message.
 
@@ -313,7 +317,10 @@ fn resolve_mcp_oauth_credentials_store_mode(
 pub(crate) async fn test_config() -> Config {
     let codex_home = tempfile::tempdir().expect("create temp dir");
     Config::load_from_base_config_with_overrides(
-        ConfigToml::default(),
+        ConfigToml {
+            model: Some("gpt-5.5".to_string()),
+            ..Default::default()
+        },
         ConfigOverrides::default(),
         AbsolutePathBuf::from_absolute_path(codex_home.path()).expect("temp dir should resolve"),
     )
@@ -592,6 +599,56 @@ fn build_network_proxy_spec(
     } else {
         network.enabled().then_some(network)
     })
+}
+
+pub fn validate_windows_sandbox_network_proxy_compatibility(
+    windows_sandbox_level: WindowsSandboxLevel,
+    network_proxy_configured: bool,
+) -> std::io::Result<()> {
+    validate_windows_sandbox_network_proxy_compatibility_for_platform(
+        cfg!(target_os = "windows"),
+        windows_sandbox_level,
+        network_proxy_configured,
+    )
+}
+
+fn validate_windows_sandbox_network_proxy_compatibility_for_platform(
+    is_windows: bool,
+    windows_sandbox_level: WindowsSandboxLevel,
+    network_proxy_configured: bool,
+) -> std::io::Result<()> {
+    if is_windows
+        && network_proxy_configured
+        && windows_sandbox_level != WindowsSandboxLevel::Elevated
+    {
+        return Err(ConstraintError::NetworkProxyIncompatibleWithUnelevatedWindowsSandbox.into());
+    }
+    Ok(())
+}
+
+fn validate_windows_network_proxy_requirements(
+    requirements: &ConfigRequirementsToml,
+    network_proxy_configured: bool,
+) -> std::io::Result<()> {
+    validate_windows_network_proxy_requirements_for_platform(
+        cfg!(target_os = "windows"),
+        requirements,
+        network_proxy_configured,
+    )
+}
+
+fn validate_windows_network_proxy_requirements_for_platform(
+    is_windows: bool,
+    requirements: &ConfigRequirementsToml,
+    network_proxy_configured: bool,
+) -> std::io::Result<()> {
+    if is_windows
+        && network_proxy_configured
+        && !requirements.allows_only_elevated_windows_sandbox()
+    {
+        return Err(ConstraintError::NetworkProxyRequiresElevatedWindowsSandboxRequirement.into());
+    }
+    Ok(())
 }
 
 /// Configured thread persistence backend.
@@ -946,9 +1003,6 @@ pub struct Config {
     /// using the Responses API. When unset, the model catalog default is used.
     pub model_reasoning_summary: Option<ReasoningSummary>,
 
-    /// Optional override to force-enable reasoning summaries for the configured model.
-    pub model_supports_reasoning_summaries: Option<bool>,
-
     /// Optional full model catalog loaded from `model_catalog_json`.
     /// When set, this replaces the bundled catalog for the current process.
     pub model_catalog: Option<ModelsResponse>,
@@ -1144,8 +1198,10 @@ pub struct MultiAgentV2Config {
     pub usage_hint_text: Option<String>,
     pub root_agent_usage_hint_text: Option<String>,
     pub subagent_usage_hint_text: Option<String>,
+    pub multi_agent_mode_hint_text: Option<String>,
     pub tool_namespace: Option<String>,
     pub hide_spawn_agent_metadata: bool,
+    pub expose_spawn_agent_model_overrides: bool,
     pub non_code_mode_only: bool,
 }
 
@@ -1165,8 +1221,10 @@ impl MultiAgentV2Config {
                 DEFAULT_MULTI_AGENT_V2_SUBAGENT_USAGE_HINT_TEXT,
                 max_concurrent_threads_per_session,
             )),
+            multi_agent_mode_hint_text: None,
             tool_namespace: Some(DEFAULT_MULTI_AGENT_V2_TOOL_NAMESPACE.to_string()),
             hide_spawn_agent_metadata: true,
+            expose_spawn_agent_model_overrides: true,
             non_code_mode_only: true,
         }
     }
@@ -1220,6 +1278,12 @@ impl AuthManagerConfig for Config {
     fn auth_route_config(&self) -> Option<AuthRouteConfig> {
         Config::auth_route_config(self)
     }
+}
+
+#[derive(Clone, Copy)]
+enum ConfigBuildPhase {
+    CloudConfigBootstrap,
+    Authoritative,
 }
 
 #[derive(Clone, Default)]
@@ -1280,10 +1344,15 @@ impl ConfigBuilder {
 
     pub async fn build(self) -> std::io::Result<Config> {
         // Keep the large config-loading future off small runtime thread stacks.
-        Box::pin(self.build_inner()).await
+        Box::pin(self.build_inner(ConfigBuildPhase::Authoritative)).await
     }
 
-    async fn build_inner(self) -> std::io::Result<Config> {
+    /// Builds the preliminary config needed to initialize cloud config loading.
+    pub async fn build_for_cloud_config_bootstrap(self) -> std::io::Result<Config> {
+        Box::pin(self.build_inner(ConfigBuildPhase::CloudConfigBootstrap)).await
+    }
+
+    async fn build_inner(self, build_phase: ConfigBuildPhase) -> std::io::Result<Config> {
         let Self {
             codex_home,
             cli_overrides,
@@ -1368,12 +1437,13 @@ impl ConfigBuilder {
                 config_layer_stack.requirements().clone(),
                 config_layer_stack.requirements_toml().clone(),
             )?;
-            let mut config = Config::load_config_with_layer_stack(
+            let mut config = Config::load_config_with_layer_stack_and_options(
                 LOCAL_FS.as_ref(),
                 lock_config_toml,
                 harness_overrides,
                 codex_home,
                 lock_config_layer_stack,
+                build_phase,
             )
             .await?;
             config.config_lock_toml = Some(Arc::new(expected_lock_config));
@@ -1382,12 +1452,13 @@ impl ConfigBuilder {
                 save_fields_resolved_from_model_catalog;
             return Ok(config);
         }
-        Config::load_config_with_layer_stack(
+        Config::load_config_with_layer_stack_and_options(
             LOCAL_FS.as_ref(),
             config_toml,
             harness_overrides,
             codex_home,
             config_layer_stack,
+            build_phase,
         )
         .await
     }
@@ -1468,7 +1539,7 @@ impl Config {
             tool_output_token_limit: self.tool_output_token_limit,
             base_instructions: self.base_instructions.clone(),
             personality_enabled: self.features.enabled(Feature::Personality),
-            model_supports_reasoning_summaries: self.model_supports_reasoning_summaries,
+            personality: self.personality,
             model_catalog: self.model_catalog.clone(),
         }
     }
@@ -1476,6 +1547,16 @@ impl Config {
     pub fn auth_route_config(&self) -> Option<AuthRouteConfig> {
         self.respect_system_proxy
             .then(AuthRouteConfig::respect_system_proxy)
+    }
+
+    /// Creates the HTTP client factory resolved from the effective feature configuration.
+    pub fn http_client_factory(&self) -> HttpClientFactory {
+        let outbound_proxy_policy = if self.respect_system_proxy {
+            OutboundProxyPolicy::RespectSystemProxy
+        } else {
+            OutboundProxyPolicy::ReqwestDefault
+        };
+        HttpClientFactory::new(outbound_proxy_policy)
     }
 
     /// Build the plugin-manager input from the effective config.
@@ -1526,6 +1607,14 @@ impl Config {
     ) -> McpConfig {
         let plugins_input = self.plugins_config_input();
         let loaded_plugins = plugins_manager.plugins_for_config(&plugins_input).await;
+        self.to_mcp_config_with_loaded_plugins(&loaded_plugins, additional_plugin_registrations)
+    }
+
+    pub(crate) fn to_mcp_config_with_loaded_plugins(
+        &self,
+        loaded_plugins: &PluginLoadOutcome,
+        additional_plugin_registrations: impl IntoIterator<Item = McpServerRegistration>,
+    ) -> McpConfig {
         let mut catalog = ResolvedMcpCatalog::builder();
         for (plugin_order, plugin) in loaded_plugins
             .plugins()
@@ -2493,21 +2582,40 @@ fn resolve_multi_agent_v2_config(config_toml: &ConfigToml) -> MultiAgentV2Config
         .and_then(|config| config.usage_hint_text.as_ref())
         .cloned()
         .or(default.usage_hint_text);
+    let hide_spawn_agent_metadata = base
+        .and_then(|config| config.hide_spawn_agent_metadata)
+        .unwrap_or(default.hide_spawn_agent_metadata);
+    let expose_spawn_agent_model_overrides = base
+        .and_then(|config| config.expose_spawn_agent_model_overrides)
+        .unwrap_or(default.expose_spawn_agent_model_overrides);
+    let mut default_root_agent_usage_hint_text = default.root_agent_usage_hint_text;
+    let mut default_subagent_usage_hint_text = default.subagent_usage_hint_text;
+    if expose_spawn_agent_model_overrides {
+        default_root_agent_usage_hint_text = Some(append_usage_hint_text(
+            default_root_agent_usage_hint_text.as_deref(),
+            DEFAULT_MULTI_AGENT_V2_MODEL_OVERRIDE_USAGE_HINT_TEXT,
+        ));
+        default_subagent_usage_hint_text = Some(append_usage_hint_text(
+            default_subagent_usage_hint_text.as_deref(),
+            DEFAULT_MULTI_AGENT_V2_MODEL_OVERRIDE_USAGE_HINT_TEXT,
+        ));
+    }
     let root_agent_usage_hint_text = resolve_optional_prompt_text(
         base.map(|config| &config.root_agent_usage_hint_text),
-        default.root_agent_usage_hint_text,
+        default_root_agent_usage_hint_text,
     );
     let subagent_usage_hint_text = resolve_optional_prompt_text(
         base.map(|config| &config.subagent_usage_hint_text),
-        default.subagent_usage_hint_text,
+        default_subagent_usage_hint_text,
     );
+    let multi_agent_mode_hint_text = base
+        .and_then(|config| config.multi_agent_mode_hint_text.as_ref())
+        .cloned()
+        .or(default.multi_agent_mode_hint_text);
     let tool_namespace = base
         .and_then(|config| config.tool_namespace.as_ref())
         .cloned()
         .or(default.tool_namespace);
-    let hide_spawn_agent_metadata = base
-        .and_then(|config| config.hide_spawn_agent_metadata)
-        .unwrap_or(default.hide_spawn_agent_metadata);
     let non_code_mode_only = base
         .and_then(|config| config.non_code_mode_only)
         .unwrap_or(default.non_code_mode_only);
@@ -2520,8 +2628,10 @@ fn resolve_multi_agent_v2_config(config_toml: &ConfigToml) -> MultiAgentV2Config
         usage_hint_text,
         root_agent_usage_hint_text,
         subagent_usage_hint_text,
+        multi_agent_mode_hint_text,
         tool_namespace,
         hide_spawn_agent_metadata,
+        expose_spawn_agent_model_overrides,
         non_code_mode_only,
     }
 }
@@ -2703,6 +2813,13 @@ fn resolve_optional_prompt_text(
         Some(Some(value)) if value.is_empty() => None,
         Some(Some(value)) => Some(value.clone()),
         Some(None) | None => default,
+    }
+}
+
+fn append_usage_hint_text(usage_hint_text: Option<&str>, additional_text: &str) -> String {
+    match usage_hint_text {
+        Some(usage_hint_text) => format!("{usage_hint_text}\n\n{additional_text}"),
+        None => additional_text.to_string(),
     }
 }
 
@@ -2913,6 +3030,25 @@ impl Config {
         overrides: ConfigOverrides,
         codex_home: AbsolutePathBuf,
         config_layer_stack: ConfigLayerStack,
+    ) -> std::io::Result<Self> {
+        Self::load_config_with_layer_stack_and_options(
+            fs,
+            cfg,
+            overrides,
+            codex_home,
+            config_layer_stack,
+            ConfigBuildPhase::Authoritative,
+        )
+        .await
+    }
+
+    async fn load_config_with_layer_stack_and_options(
+        fs: &dyn ExecutorFileSystem,
+        cfg: ConfigToml,
+        overrides: ConfigOverrides,
+        codex_home: AbsolutePathBuf,
+        config_layer_stack: ConfigLayerStack,
+        build_phase: ConfigBuildPhase,
     ) -> std::io::Result<Self> {
         // Keep the large config-construction future off small test thread stacks.
         Box::pin(async move {
@@ -3337,7 +3473,7 @@ impl Config {
                     network_proxy,
                 );
             }
-            configured_network_proxy_config.network.enabled = true;
+            configured_network_proxy_config.enabled = true;
         }
         let approval_policy_was_explicit =
             approval_policy_override.is_some() || cfg.approval_policy.is_some();
@@ -3710,6 +3846,17 @@ impl Config {
             network_requirements,
             &network_permission_profile,
         )?;
+        if matches!(build_phase, ConfigBuildPhase::Authoritative) {
+            let network_proxy_enabled = network.as_ref().is_some_and(NetworkProxySpec::enabled);
+            validate_windows_network_proxy_requirements(
+                config_layer_stack.requirements_toml(),
+                network_proxy_enabled,
+            )?;
+            validate_windows_sandbox_network_proxy_compatibility(
+                windows_sandbox_level,
+                network_proxy_enabled,
+            )?;
+        }
         let mut helper_readable_roots = get_readable_roots_required_for_codex_runtime(
             &codex_home,
             zsh_path.as_ref(),
@@ -3872,7 +4019,6 @@ impl Config {
             model_reasoning_effort: cfg.model_reasoning_effort,
             plan_mode_reasoning_effort: cfg.plan_mode_reasoning_effort,
             model_reasoning_summary: cfg.model_reasoning_summary,
-            model_supports_reasoning_summaries: cfg.model_supports_reasoning_summaries,
             model_catalog,
             model_verbosity: cfg.model_verbosity,
             chatgpt_base_url: cfg
@@ -4097,18 +4243,28 @@ impl Config {
                         network_proxy,
                     );
                 }
-                configured_network_proxy_config.network.enabled = true;
+                configured_network_proxy_config.enabled = true;
             }
             configured_network_proxy_config
         } else {
             NetworkProxyConfig::default()
         };
 
-        build_network_proxy_spec(
+        let network = build_network_proxy_spec(
             configured_network_proxy_config,
             self.config_layer_stack.requirements().network.clone(),
             permission_profile,
-        )
+        )?;
+        let network_proxy_enabled = network.as_ref().is_some_and(NetworkProxySpec::enabled);
+        validate_windows_network_proxy_requirements(
+            self.config_layer_stack.requirements_toml(),
+            network_proxy_enabled,
+        )?;
+        validate_windows_sandbox_network_proxy_compatibility(
+            WindowsSandboxLevel::from_config(self),
+            network_proxy_enabled,
+        )?;
+        Ok(network)
     }
 
     pub fn bundled_skills_enabled(&self) -> bool {

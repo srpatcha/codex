@@ -56,10 +56,16 @@ pub struct MultiAgentV2ConfigToml {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subagent_usage_hint_text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub multi_agent_mode_hint_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1, max = 64), regex(pattern = r"^[a-zA-Z0-9_-]+$"))]
     pub tool_namespace: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hide_spawn_agent_metadata: Option<bool>,
+    /// Exposes `model` and `reasoning_effort` on the multi-agent v2 spawn tool and adds
+    /// corresponding guidance to root and subagent usage hints.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expose_spawn_agent_model_overrides: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub non_code_mode_only: Option<bool>,
 }

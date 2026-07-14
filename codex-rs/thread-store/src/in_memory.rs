@@ -27,6 +27,7 @@ use crate::LoadThreadHistoryParams;
 use crate::ReadThreadByRolloutPathParams;
 use crate::ReadThreadParams;
 use crate::ResumeThreadParams;
+use crate::StoredModelContext;
 use crate::StoredThread;
 use crate::StoredThreadHistory;
 use crate::ThreadMetadataPatch;
@@ -218,17 +219,22 @@ mod tests {
             })
             .await
             .expect("register rollout path");
-        store
-            .update_thread_metadata(UpdateThreadMetadataParams {
-                thread_id,
-                patch: ThreadMetadataPatch {
-                    history_mode: Some(ThreadHistoryMode::Paginated),
-                    ..Default::default()
-                },
-                include_archived: false,
-            })
-            .await
-            .expect("seed paginated metadata");
+        {
+            let mut state = store.state.lock().await;
+            state
+                .created_threads
+                .get_mut(&thread_id)
+                .expect("created thread")
+                .history_mode = ThreadHistoryMode::Paginated;
+            let Some(RolloutItem::SessionMeta(meta_line)) = state
+                .histories
+                .get_mut(&thread_id)
+                .and_then(|history| history.first_mut())
+            else {
+                panic!("canonical session meta");
+            };
+            meta_line.meta.history_mode = ThreadHistoryMode::Paginated;
+        }
 
         let thread = store
             .read_thread(ReadThreadParams {
@@ -363,6 +369,7 @@ pub struct InMemoryThreadStoreCalls {
     pub shutdown_thread: usize,
     pub discard_thread: usize,
     pub load_history: usize,
+    pub load_latest_model_context: usize,
     pub read_thread: usize,
     pub read_thread_with_history: usize,
     pub read_thread_by_rollout_path: usize,
@@ -477,17 +484,21 @@ impl InMemoryThreadStore {
     }
 
     async fn append_items(&self, params: AppendThreadItemsParams) -> ThreadStoreResult<()> {
-        let canonical_items = persisted_rollout_items(params.items.as_slice());
-        if canonical_items.is_empty() {
+        if params.items.is_empty() {
             return Ok(());
         }
         let mut state = self.state.lock().await;
+        let history_mode = history_mode_from_state(&state, params.thread_id);
+        let persisted_items = persisted_rollout_items(params.items.as_slice(), history_mode);
+        if persisted_items.is_empty() {
+            return Ok(());
+        }
         state.calls.append_items += 1;
         state
             .histories
             .entry(params.thread_id)
             .or_default()
-            .extend(canonical_items);
+            .extend(persisted_items);
         Ok(())
     }
 
@@ -507,6 +518,25 @@ impl InMemoryThreadStore {
         let history_mode = history_mode_from_state(&state, params.thread_id);
         reject_paginated_history_mode(history_mode)?;
         Ok(StoredThreadHistory {
+            thread_id: params.thread_id,
+            items: items.clone(),
+        })
+    }
+
+    async fn load_latest_model_context(
+        &self,
+        params: LoadThreadHistoryParams,
+    ) -> ThreadStoreResult<StoredModelContext> {
+        let mut state = self.state.lock().await;
+        state.calls.load_latest_model_context += 1;
+        let items =
+            state
+                .histories
+                .get(&params.thread_id)
+                .ok_or(ThreadStoreError::ThreadNotFound {
+                    thread_id: params.thread_id,
+                })?;
+        Ok(StoredModelContext {
             thread_id: params.thread_id,
             items: items.clone(),
         })
@@ -650,6 +680,13 @@ impl ThreadStore for InMemoryThreadStore {
         Box::pin(InMemoryThreadStore::load_history(self, params))
     }
 
+    fn load_latest_model_context(
+        &self,
+        params: LoadThreadHistoryParams,
+    ) -> ThreadStoreFuture<'_, StoredModelContext> {
+        Box::pin(InMemoryThreadStore::load_latest_model_context(self, params))
+    }
+
     fn read_thread(&self, params: ReadThreadParams) -> ThreadStoreFuture<'_, StoredThread> {
         Box::pin(InMemoryThreadStore::read_thread(self, params))
     }
@@ -764,7 +801,9 @@ fn stored_thread_from_state(
             .and_then(|metadata| metadata.model_provider.clone())
             .unwrap_or_else(|| "test".to_string()),
         model: metadata.and_then(|metadata| metadata.model.clone()),
-        reasoning_effort: metadata.and_then(|metadata| metadata.reasoning_effort.clone()),
+        reasoning_effort: metadata
+            .and_then(|metadata| metadata.reasoning_effort.clone())
+            .flatten(),
         created_at: metadata
             .and_then(|metadata| metadata.created_at)
             .unwrap_or_else(Utc::now),
@@ -784,9 +823,7 @@ fn stored_thread_from_state(
         source: metadata
             .and_then(|metadata| metadata.source.clone())
             .unwrap_or_else(|| created.source.clone()),
-        history_mode: metadata
-            .and_then(|metadata| metadata.history_mode)
-            .unwrap_or(created.history_mode),
+        history_mode: created.history_mode,
         thread_source: metadata
             .and_then(|metadata| metadata.thread_source.clone())
             .unwrap_or_else(|| created.thread_source.clone()),
@@ -811,15 +848,9 @@ fn history_mode_from_state(
     thread_id: ThreadId,
 ) -> ThreadHistoryMode {
     state
-        .metadata_updates
+        .created_threads
         .get(&thread_id)
-        .and_then(|metadata| metadata.history_mode)
-        .or_else(|| {
-            state
-                .created_threads
-                .get(&thread_id)
-                .map(|thread| thread.history_mode)
-        })
+        .map(|thread| thread.history_mode)
         .unwrap_or_default()
 }
 

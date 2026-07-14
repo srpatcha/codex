@@ -269,7 +269,7 @@ impl App {
         }
 
         let (session, turns, live_attached) = match app_server
-            .resume_thread(self.config.clone(), thread_id)
+            .resume_thread(self.config.clone(), thread_id, self.resume_model_settings())
             .await
         {
             Ok(started) => (started.session, started.turns, true),
@@ -539,7 +539,13 @@ impl App {
         self.refresh_in_memory_config_from_disk_best_effort("starting a new thread")
             .await;
         let model = self.chat_widget.current_model().to_string();
-        let config = self.fresh_session_config();
+        let mut config = self.fresh_session_config();
+        apply_managed_new_thread_defaults(
+            &mut config,
+            app_server.managed_new_thread_defaults(),
+            &self.cli_kv_overrides,
+            &self.harness_overrides,
+        );
         let summary = session_summary(
             self.chat_widget.token_usage(),
             self.chat_widget.thread_id(),
@@ -783,7 +789,11 @@ impl App {
             self.chat_widget.rollout_path().as_deref(),
         );
         match app_server
-            .resume_thread(resume_config.clone(), target_session.thread_id)
+            .resume_thread(
+                resume_config.clone(),
+                target_session.thread_id,
+                self.resume_model_settings(),
+            )
             .await
         {
             Ok(resumed) => {

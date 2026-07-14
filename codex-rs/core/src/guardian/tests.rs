@@ -1743,6 +1743,16 @@ async fn guardian_review_request_layout_matches_model_visible_request_snapshot()
     ));
     let request = request_log.single_request();
     let request_body = request.body_json();
+    let guardian_tool_names = request_body["tools"]
+        .as_array()
+        .expect("guardian request tools")
+        .iter()
+        .map(|tool| tool["name"].as_str().expect("guardian request tool name"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        guardian_tool_names,
+        vec!["exec_command", "write_stdin", "view_image"]
+    );
     let guardian_user_text = request.message_input_texts("user").join("\n");
     assert!(
         guardian_user_text.contains(&format!("${GUARDIAN_SKILL_NAME}")),
@@ -2216,10 +2226,12 @@ async fn guardian_reused_trunk_ignores_stale_prior_turn_completion() -> anyhow::
             id: "stale-turn".to_string(),
             msg: EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: "stale-turn".to_string(),
+                started_at: None,
                 last_agent_message: Some(
                     "{\"risk_level\":\"high\",\"user_authorization\":\"low\",\"outcome\":\"deny\",\"rationale\":\"stale guardian rationale\"}"
                         .to_string(),
                 ),
+                error: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: Some(1),
@@ -2896,6 +2908,7 @@ async fn guardian_review_session_config_preserves_parent_network_proxy() {
         /*live_network_config*/ None,
         "parent-active-model",
         Some(codex_protocol::openai_models::ReasoningEffort::Low),
+        /*model_messages*/ None,
     )
     .expect("guardian config");
 
@@ -2929,6 +2942,7 @@ async fn guardian_review_session_config_clears_parent_developer_instructions() {
         /*live_network_config*/ None,
         "active-model",
         /*reasoning_effort*/ None,
+        /*model_messages*/ None,
     )
     .expect("guardian config");
 
@@ -2952,6 +2966,7 @@ async fn guardian_review_session_config_clears_legacy_notify() {
         /*live_network_config*/ None,
         "active-model",
         /*reasoning_effort*/ None,
+        /*model_messages*/ None,
     )
     .expect("guardian config");
 
@@ -2961,11 +2976,11 @@ async fn guardian_review_session_config_clears_legacy_notify() {
 #[tokio::test]
 async fn guardian_review_session_config_uses_live_network_proxy_state() {
     let mut parent_config = test_config().await;
-    let mut parent_network = NetworkProxyConfig::default();
-    parent_network.network.enabled = true;
-    parent_network
-        .network
-        .set_allowed_domains(vec!["parent.example".to_string()]);
+    let mut parent_network = NetworkProxyConfig {
+        enabled: true,
+        ..Default::default()
+    };
+    parent_network.set_allowed_domains(vec!["parent.example".to_string()]);
     parent_config.permissions.network = Some(
         NetworkProxySpec::from_config_and_constraints(
             parent_network,
@@ -2975,17 +2990,18 @@ async fn guardian_review_session_config_uses_live_network_proxy_state() {
         .expect("parent network proxy spec"),
     );
 
-    let mut live_network = NetworkProxyConfig::default();
-    live_network.network.enabled = true;
-    live_network
-        .network
-        .set_allowed_domains(vec!["github.com".to_string()]);
+    let mut live_network = NetworkProxyConfig {
+        enabled: true,
+        ..Default::default()
+    };
+    live_network.set_allowed_domains(vec!["github.com".to_string()]);
 
     let guardian_config = build_guardian_review_session_config_for_test(
         &parent_config,
         Some(live_network.clone()),
         "active-model",
         /*reasoning_effort*/ None,
+        /*model_messages*/ None,
     )
     .expect("guardian config");
 
@@ -3028,6 +3044,7 @@ async fn guardian_review_session_config_disables_mcp_apps_plugins_and_memories()
         /*live_network_config*/ None,
         "active-model",
         /*reasoning_effort*/ None,
+        /*model_messages*/ None,
     )
     .expect("guardian config");
 
@@ -3058,6 +3075,7 @@ async fn guardian_review_session_config_allows_pinned_disabled_feature() {
         /*live_network_config*/ None,
         "active-model",
         /*reasoning_effort*/ None,
+        /*model_messages*/ None,
     )
     .expect("guardian config should continue when a disabled feature is pinned on");
 
@@ -3076,6 +3094,7 @@ async fn guardian_review_session_config_uses_parent_active_model_instead_of_hard
         /*live_network_config*/ None,
         "active-model",
         /*reasoning_effort*/ None,
+        /*model_messages*/ None,
     )
     .expect("guardian config");
 
@@ -3094,6 +3113,7 @@ async fn guardian_review_session_config_keeps_bedrock_provider_for_bedrock_gpt_5
         /*live_network_config*/ None,
         AMAZON_BEDROCK_GPT_5_4_MODEL_ID,
         Some(ReasoningEffort::Low),
+        /*model_messages*/ None,
     )
     .expect("guardian config");
 
@@ -3148,6 +3168,7 @@ async fn guardian_review_session_config_uses_requirements_guardian_policy_config
         /*live_network_config*/ None,
         "active-model",
         /*reasoning_effort*/ None,
+        /*model_messages*/ None,
     )
     .expect("guardian config");
 
@@ -3186,6 +3207,7 @@ async fn guardian_review_session_config_uses_default_guardian_policy_without_req
         /*live_network_config*/ None,
         "active-model",
         /*reasoning_effort*/ None,
+        /*model_messages*/ None,
     )
     .expect("guardian config");
 

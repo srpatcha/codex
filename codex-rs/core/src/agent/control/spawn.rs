@@ -9,6 +9,17 @@ struct SpawnAgentThreadInheritance {
     exec_policy: Option<Arc<crate::exec_policy::ExecPolicyManager>>,
 }
 
+/// Initial input delivered after a spawned agent acquires execution capacity.
+///
+/// V2 communication spawns keep the communication and its context paired so centralized
+/// submission and lifecycle logging cannot receive one without the other. Other spawn sources
+/// provide user input directly, making an uncontextualized inter-agent communication
+/// unrepresentable.
+enum SpawnInitialInput {
+    UserInput(Vec<UserInput>),
+    InterAgentCommunication(InterAgentCommunication, AgentCommunicationContext),
+}
+
 fn default_agent_nickname_list() -> Vec<&'static str> {
     AGENT_NAMES
         .lines()
@@ -84,17 +95,88 @@ fn is_multi_agent_v2_usage_hint_message(item: &ResponseItem, usage_hint_texts: &
 }
 
 impl AgentControl {
+    /// Restore persisted V2 agent identities without reopening their runtimes.
+    pub(crate) async fn restore_v2_agent_metadata(
+        &self,
+        config: &Config,
+        root_thread_id: ThreadId,
+    ) {
+        self.state.register_root_thread(root_thread_id);
+
+        let Ok(state) = self.upgrade() else {
+            return;
+        };
+        let Some(agent_graph_store) = state.agent_graph_store() else {
+            return;
+        };
+        let descendant_ids = match agent_graph_store
+            .list_thread_spawn_descendants(
+                root_thread_id,
+                Some(codex_agent_graph_store::ThreadSpawnEdgeStatus::Open),
+            )
+            .await
+        {
+            Ok(descendant_ids) => descendant_ids,
+            Err(err) => {
+                warn!("failed to restore persisted V2 agent metadata for {root_thread_id}: {err}");
+                return;
+            }
+        };
+
+        for thread_id in descendant_ids {
+            if self.state.agent_metadata_for_thread(thread_id).is_some() {
+                continue;
+            }
+            let restore_result = async {
+                let stored_thread = state
+                    .read_stored_thread(ReadThreadParams {
+                        thread_id,
+                        include_archived: true,
+                        include_history: false,
+                    })
+                    .await?;
+                let stored_agent_path = stored_thread
+                    .agent_path
+                    .as_deref()
+                    .map(AgentPath::try_from)
+                    .transpose()
+                    .map_err(|err| {
+                        CodexErr::InvalidRequest(format!("invalid stored agent path: {err}"))
+                    })?;
+                let mut reservation = self.state.reserve_spawn_slot(/*max_threads*/ None)?;
+                let mut metadata = self.prepare_agent_metadata(
+                    &mut reservation,
+                    config,
+                    stored_agent_path.or_else(|| stored_thread.source.get_agent_path()),
+                    stored_thread
+                        .agent_role
+                        .or_else(|| stored_thread.source.get_agent_role()),
+                    stored_thread
+                        .agent_nickname
+                        .or_else(|| stored_thread.source.get_nickname()),
+                )?;
+                metadata.agent_id = Some(thread_id);
+                reservation.commit(metadata);
+                Ok::<(), CodexErr>(())
+            }
+            .await;
+            if let Err(err) = restore_result {
+                warn!("failed to restore V2 agent metadata for {thread_id}: {err}");
+            }
+        }
+    }
+
     /// Spawn a new agent thread and submit the initial prompt.
     #[cfg(test)]
     pub(crate) async fn spawn_agent(
         &self,
         config: Config,
-        initial_operation: Op,
+        initial_input: Vec<UserInput>,
         session_source: Option<SessionSource>,
     ) -> CodexResult<ThreadId> {
         let spawned_agent = Box::pin(self.spawn_agent_internal(
             config,
-            initial_operation,
+            SpawnInitialInput::UserInput(initial_input),
             session_source,
             SpawnAgentOptions::default(),
         ))
@@ -106,12 +188,34 @@ impl AgentControl {
     pub(crate) async fn spawn_agent_with_metadata(
         &self,
         config: Config,
-        initial_operation: Op,
+        initial_input: Vec<UserInput>,
         session_source: Option<SessionSource>,
         options: SpawnAgentOptions, // TODO(jif) drop with new fork.
     ) -> CodexResult<LiveAgent> {
-        Box::pin(self.spawn_agent_internal(config, initial_operation, session_source, options))
-            .await
+        Box::pin(self.spawn_agent_internal(
+            config,
+            SpawnInitialInput::UserInput(initial_input),
+            session_source,
+            options,
+        ))
+        .await
+    }
+
+    pub(crate) async fn spawn_agent_with_communication(
+        &self,
+        config: Config,
+        communication: InterAgentCommunication,
+        context: AgentCommunicationContext,
+        session_source: Option<SessionSource>,
+        options: SpawnAgentOptions,
+    ) -> CodexResult<LiveAgent> {
+        Box::pin(self.spawn_agent_internal(
+            config,
+            SpawnInitialInput::InterAgentCommunication(communication, context),
+            session_source,
+            options,
+        ))
+        .await
     }
 
     pub(crate) async fn ensure_v2_agent_loaded(
@@ -197,7 +301,7 @@ impl AgentControl {
     async fn spawn_agent_internal(
         &self,
         config: Config,
-        initial_operation: Op,
+        initial_input: SpawnInitialInput,
         session_source: Option<SessionSource>,
         options: SpawnAgentOptions,
     ) -> CodexResult<LiveAgent> {
@@ -356,8 +460,21 @@ impl AgentControl {
         )
         .await;
 
-        self.send_input_after_capacity_check(new_thread.thread_id, &state, initial_operation)
-            .await?;
+        match initial_input {
+            SpawnInitialInput::UserInput(input) => {
+                self.send_input_after_capacity_check(new_thread.thread_id, &state, input)
+                    .await?;
+            }
+            SpawnInitialInput::InterAgentCommunication(communication, context) => {
+                self.send_inter_agent_communication_after_capacity_check(
+                    new_thread.thread_id,
+                    &state,
+                    communication,
+                    context,
+                )
+                .await?;
+            }
+        }
         if multi_agent_version != MultiAgentVersion::V2 {
             let child_reference = agent_metadata
                 .agent_path

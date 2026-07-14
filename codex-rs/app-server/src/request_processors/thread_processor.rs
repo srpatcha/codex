@@ -164,6 +164,34 @@ fn merge_persisted_resume_metadata(
     }
 }
 
+fn merge_persisted_approvals_reviewer(
+    thread_history: &InitialHistory,
+    request_overrides: Option<&HashMap<String, serde_json::Value>>,
+    typesafe_overrides: &mut ConfigOverrides,
+) {
+    if typesafe_overrides.approvals_reviewer.is_some()
+        || request_overrides.is_some_and(|overrides| overrides.contains_key("approvals_reviewer"))
+    {
+        return;
+    }
+
+    let InitialHistory::Resumed(resumed_history) = thread_history else {
+        return;
+    };
+    typesafe_overrides.approvals_reviewer =
+        resumed_history
+            .history
+            .iter()
+            .rev()
+            .find_map(|item| match item {
+                RolloutItem::TurnContext(turn_context) => turn_context.approvals_reviewer,
+                RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) => {
+                    Some(event.thread_settings.approvals_reviewer)
+                }
+                _ => None,
+            });
+}
+
 fn normalize_thread_list_cwd_filters(
     cwd: Option<ThreadListCwdFilter>,
 ) -> Result<Option<Vec<PathBuf>>, JSONRPCErrorError> {
@@ -364,6 +392,7 @@ pub(crate) struct ThreadRequestProcessor {
     pub(super) log_db: Option<LogDbLayer>,
     pub(super) background_tasks: TaskTracker,
     pub(super) skills_watcher: Arc<SkillsWatcher>,
+    pub(super) initial_config_warnings: Arc<Vec<ConfigWarningNotification>>,
 }
 
 /// Outcome of trying to satisfy a resume request from an already loaded thread.
@@ -395,6 +424,7 @@ impl ThreadRequestProcessor {
         state_db: Option<StateDbHandle>,
         log_db: Option<LogDbLayer>,
         skills_watcher: Arc<SkillsWatcher>,
+        initial_config_warnings: Vec<ConfigWarningNotification>,
     ) -> Self {
         Self {
             auth_manager,
@@ -413,6 +443,7 @@ impl ThreadRequestProcessor {
             log_db,
             background_tasks: TaskTracker::new(),
             skills_watcher,
+            initial_config_warnings: Arc::new(initial_config_warnings),
         }
     }
 
@@ -932,14 +963,20 @@ impl ThreadRequestProcessor {
             thread_source,
             environments,
         } = params;
+        if matches!(
+            history_mode,
+            Some(codex_app_server_protocol::ThreadHistoryMode::Paginated)
+        ) {
+            return Err(method_not_found("paginated_threads is not supported yet"));
+        }
         if sandbox.is_some() && permissions.is_some() {
             return Err(invalid_request(
                 "`permissions` cannot be combined with `sandbox`",
             ));
         }
-        let environment_selections =
-            resolve_turn_environment_selections(self.thread_manager.as_ref(), environments)?;
         let runtime_workspace_roots = runtime_workspace_roots.map(resolve_runtime_workspace_roots);
+        let environments =
+            resolve_turn_environment_selections(self.thread_manager.as_ref(), environments)?;
         let mut typesafe_overrides = self.build_thread_config_overrides(
             model,
             model_provider,
@@ -968,6 +1005,7 @@ impl ThreadRequestProcessor {
         };
         let request_trace = request_context.request_trace();
         let config_manager = self.config_manager.clone();
+        let initial_config_warnings = Arc::clone(&self.initial_config_warnings);
         let outgoing = Arc::clone(&listener_task_context.outgoing);
         let error_request_id = request_id.clone();
         let thread_start_task = async move {
@@ -985,11 +1023,12 @@ impl ThreadRequestProcessor {
                 history_mode.map(Into::into),
                 session_start_source,
                 thread_source.map(Into::into),
-                environment_selections,
+                environments,
                 service_name,
                 allow_provider_model_fallback,
                 experimental_raw_events,
                 request_trace,
+                initial_config_warnings,
             )
             .await
             {
@@ -1061,11 +1100,12 @@ impl ThreadRequestProcessor {
         history_mode: Option<ThreadHistoryMode>,
         session_start_source: Option<codex_app_server_protocol::ThreadStartSource>,
         thread_source: Option<codex_protocol::protocol::ThreadSource>,
-        environments: Option<Vec<TurnEnvironmentSelection>>,
+        environment_selections: Option<Vec<TurnEnvironmentSelection>>,
         service_name: Option<String>,
         allow_provider_model_fallback: bool,
         experimental_raw_events: bool,
         request_trace: Option<W3cTraceContext>,
+        initial_config_warnings: Arc<Vec<ConfigWarningNotification>>,
     ) -> Result<(), JSONRPCErrorError> {
         let thread_start_started_at = std::time::Instant::now();
         let requested_cwd = typesafe_overrides.cwd.clone();
@@ -1073,7 +1113,6 @@ impl ThreadRequestProcessor {
             .load_with_overrides(config_overrides.clone(), typesafe_overrides.clone())
             .await
             .map_err(|err| config_load_error(&err))?;
-
         // The user may have requested WorkspaceWrite or DangerFullAccess via
         // the command line, though in the process of deriving the Config, it
         // could be downgraded to ReadOnly (perhaps there is no sandbox
@@ -1139,10 +1178,25 @@ impl ThreadRequestProcessor {
                 .map_err(|err| config_load_error(&err))?;
         }
 
-        let environments = environments.unwrap_or_else(|| {
+        if let Ok(Some(err)) =
+            codex_core::check_execpolicy_for_warnings(&config.config_layer_stack).await
+        {
+            let notification = crate::exec_policy_config_warning(&err);
+            if !initial_config_warnings.contains(&notification) {
+                listener_task_context
+                    .outgoing
+                    .send_server_notification_to_connections(
+                        &[request_id.connection_id],
+                        ServerNotification::ConfigWarning(notification),
+                    )
+                    .await;
+            }
+        }
+
+        let environments = environment_selections.unwrap_or_else(|| {
             listener_task_context
                 .thread_manager
-                .default_environment_selections(&config.cwd)
+                .default_environment_selections(&config.cwd, &config.workspace_roots)
         });
         let dynamic_tools = dynamic_tools.unwrap_or_default();
         if !dynamic_tools.is_empty() {
@@ -1267,10 +1321,7 @@ impl ThreadRequestProcessor {
             /*has_in_progress_turn*/ false,
         );
 
-        let sandbox = thread_response_sandbox_policy(
-            &config_snapshot.permission_profile,
-            config_snapshot.cwd().as_path(),
-        );
+        let sandbox = config_snapshot.sandbox_policy().into();
         let cwd = config_snapshot.cwd().clone();
         let active_permission_profile =
             thread_response_active_permission_profile(config_snapshot.active_permission_profile);
@@ -2290,7 +2341,7 @@ impl ThreadRequestProcessor {
                 let (mut thread, history) =
                     thread_from_stored_thread(stored_thread, fallback_provider, &self.config.cwd);
                 if include_turns && let Some(history) = history {
-                    thread.turns = build_api_turns_from_rollout_items(&history.items);
+                    thread.turns = build_legacy_api_turns_from_rollout_items(&history.items);
                 }
                 Ok(Some(thread))
             }
@@ -2359,7 +2410,7 @@ impl ThreadRequestProcessor {
                 .load_history(/*include_archived*/ true)
                 .await
                 .map_err(|err| thread_read_history_load_error(thread_id, err))?;
-            thread.turns = build_api_turns_from_rollout_items(&history.items);
+            thread.turns = build_legacy_api_turns_from_rollout_items(&history.items);
         }
 
         Ok(())
@@ -2460,19 +2511,18 @@ impl ThreadRequestProcessor {
                 }
                 err => internal_error(format!("failed to list thread items: {err}")),
             })?;
-        let data =
-            page.items
-                .into_iter()
-                .map(|item| {
-                    serde_json::from_slice::<ThreadItem>(&item.materialized_thread_item_json)
-                        .map_err(|err| {
-                            internal_error(format!(
-                                "failed to deserialize stored thread item {}: {err}",
-                                item.item_key
-                            ))
-                        })
+        let data = page
+            .items
+            .into_iter()
+            .map(|item| {
+                serde_json::from_slice::<ThreadItem>(&item.item_json).map_err(|err| {
+                    internal_error(format!(
+                        "failed to deserialize stored thread item {}: {err}",
+                        item.item_id
+                    ))
                 })
-                .collect::<Result<Vec<_>, _>>()?;
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(ThreadItemsListResponse {
             data,
@@ -2733,15 +2783,18 @@ impl ThreadRequestProcessor {
             developer_instructions,
             personality,
         );
-        self.load_and_apply_persisted_resume_metadata(
-            &thread_history,
-            &mut request_overrides,
-            &mut typesafe_overrides,
-        )
-        .await;
+        let has_explicit_model_resume_override =
+            has_model_resume_override(request_overrides.as_ref(), &typesafe_overrides);
+        let persisted_metadata = self
+            .load_and_apply_persisted_resume_metadata(
+                &thread_history,
+                &mut request_overrides,
+                &mut typesafe_overrides,
+            )
+            .await;
 
         // Derive a Config using the same logic as new conversation, honoring overrides if provided.
-        let config = match self
+        let mut config = match self
             .config_manager
             .load_for_cwd(request_overrides, typesafe_overrides, history_cwd)
             .await
@@ -2753,6 +2806,13 @@ impl ThreadRequestProcessor {
                 return Ok(());
             }
         };
+        if !has_explicit_model_resume_override
+            && persisted_metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.reasoning_effort.is_none())
+        {
+            config.model_reasoning_effort = None;
+        }
 
         let response_history = thread_history.clone();
 
@@ -2844,10 +2904,7 @@ impl ThreadRequestProcessor {
                     /*has_live_in_progress_turn*/ false,
                 );
                 let config_snapshot = codex_thread.config_snapshot().await;
-                let sandbox = thread_response_sandbox_policy(
-                    &config_snapshot.permission_profile,
-                    config_snapshot.cwd().as_path(),
-                );
+                let sandbox = config_snapshot.sandbox_policy().into();
                 let active_permission_profile = thread_response_active_permission_profile(
                     config_snapshot.active_permission_profile,
                 );
@@ -2936,6 +2993,11 @@ impl ThreadRequestProcessor {
         request_overrides: &mut Option<HashMap<String, serde_json::Value>>,
         typesafe_overrides: &mut ConfigOverrides,
     ) -> Option<ThreadMetadata> {
+        merge_persisted_approvals_reviewer(
+            thread_history,
+            request_overrides.as_ref(),
+            typesafe_overrides,
+        );
         let InitialHistory::Resumed(resumed_history) = thread_history else {
             return None;
         };
@@ -3387,6 +3449,7 @@ impl ThreadRequestProcessor {
     ) -> Result<(), JSONRPCErrorError> {
         let ThreadForkParams {
             thread_id,
+            last_turn_id,
             path,
             model,
             model_provider,
@@ -3410,6 +3473,16 @@ impl ThreadRequestProcessor {
                 "`permissions` cannot be combined with `sandbox`",
             ));
         }
+        let source_thread = self
+            .read_stored_thread_for_resume(
+                &thread_id,
+                path.as_ref(),
+                /*include_history*/ false,
+            )
+            .await?;
+        if matches!(source_thread.history_mode, ThreadHistoryMode::Paginated) {
+            return Err(method_not_found("paginated_threads is not supported yet"));
+        }
         let mut source_thread = self
             .read_stored_thread_for_resume(&thread_id, path.as_ref(), /*include_history*/ true)
             .await?;
@@ -3421,12 +3494,20 @@ impl ThreadRequestProcessor {
         let history_items = source_thread
             .history
             .take()
-            .map(|history| Arc::new(history.items))
+            .map(|history| history.items)
             .ok_or_else(|| {
                 internal_error(format!(
                     "thread {source_thread_id} did not include persisted history"
                 ))
             })?;
+        let history_items = if let Some(last_turn_id) = last_turn_id.as_deref() {
+            Arc::new(
+                truncate_rollout_after_turn_id(&history_items, last_turn_id)
+                    .map_err(|err| core_thread_write_error("truncate thread for fork", err))?,
+            )
+        } else {
+            Arc::new(history_items)
+        };
         let history_cwd = Some(source_thread.cwd.clone());
 
         // Persist Windows sandbox mode.
@@ -3592,10 +3673,7 @@ impl ThreadRequestProcessor {
             /*has_in_progress_turn*/ false,
         );
         let config_snapshot = forked_thread.config_snapshot().await;
-        let sandbox = thread_response_sandbox_policy(
-            &config_snapshot.permission_profile,
-            config_snapshot.cwd().as_path(),
-        );
+        let sandbox = config_snapshot.sandbox_policy().into();
         let active_permission_profile =
             thread_response_active_permission_profile(config_snapshot.active_permission_profile);
         let thread_originator = config_snapshot.originator.clone();
@@ -4044,7 +4122,7 @@ fn reconstruct_thread_turns_for_turns_list(
         || active_turn
             .as_ref()
             .is_some_and(|turn| matches!(turn.status, TurnStatus::InProgress));
-    let mut turns = build_api_turns_from_rollout_items(items);
+    let mut turns = build_legacy_api_turns_from_rollout_items(items);
     normalize_thread_turns_status(&mut turns, loaded_status, has_live_in_progress_turn);
     if let Some(active_turn) = active_turn {
         merge_turn_history_with_active_turn(&mut turns, active_turn);
@@ -4417,10 +4495,7 @@ fn preview_from_rollout_items(items: &[RolloutItem]) -> String {
             },
             _ => None,
         })
-        .map(|preview| match preview.find(USER_MESSAGE_BEGIN) {
-            Some(idx) => preview[idx + USER_MESSAGE_BEGIN.len()..].trim().to_string(),
-            None => preview,
-        })
+        .map(|preview| strip_user_message_prefix(preview.as_str()).to_string())
         .unwrap_or_default()
 }
 

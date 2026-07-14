@@ -76,6 +76,43 @@ async fn resumed_initial_messages_render_history() {
 }
 
 #[tokio::test]
+async fn restored_conversation_ultra_remains_selected_after_switching_to_plan() {
+    let (mut chat, _rx, _ops) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    chat.set_feature_enabled(Feature::CollaborationModes, /*enabled*/ true);
+    chat.set_plan_mode_reasoning_effort(Some(ReasoningEffortConfig::High));
+
+    chat.handle_thread_session(crate::session_state::ThreadSessionState {
+        thread_id: ThreadId::new(),
+        forked_from_id: None,
+        fork_parent_title: None,
+        thread_name: None,
+        model: "gpt-5.4".to_string(),
+        model_provider_id: "test-provider".to_string(),
+        service_tier: None,
+        approval_policy: AskForApproval::Never,
+        approvals_reviewer: ApprovalsReviewer::User,
+        permission_profile: PermissionProfile::read_only(),
+        active_permission_profile: None,
+        cwd: test_path_buf("/home/user/project").abs(),
+        runtime_workspace_roots: Vec::new(),
+        instruction_source_paths: Vec::new(),
+        reasoning_effort: Some(ReasoningEffortConfig::Ultra),
+        collaboration_mode: None,
+        personality: None,
+        message_history: None,
+        network_proxy: None,
+        rollout_path: None,
+    });
+    chat.handle_key_event(KeyEvent::from(KeyCode::BackTab));
+
+    assert_eq!(chat.active_collaboration_mode_kind(), ModeKind::Plan);
+    assert_eq!(
+        chat.current_reasoning_effort(),
+        Some(ReasoningEffortConfig::Ultra)
+    );
+}
+
+#[tokio::test]
 async fn replayed_user_messages_seed_composer_history() {
     let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.bottom_pane.set_history_metadata(
@@ -867,7 +904,7 @@ async fn replayed_thread_closed_notification_does_not_exit_tui() {
 }
 
 #[tokio::test]
-async fn replayed_reasoning_item_hides_raw_reasoning_when_disabled() {
+async fn replayed_reasoning_item_preserves_summary_parts_and_hides_raw_reasoning_when_disabled() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.config.show_raw_agent_reasoning = false;
     chat.handle_thread_session(crate::session_state::ThreadSessionState {
@@ -897,7 +934,10 @@ async fn replayed_reasoning_item_hides_raw_reasoning_when_disabled() {
     chat.replay_thread_item(
         AppServerThreadItem::Reasoning {
             id: "reasoning-1".to_string(),
-            summary: vec!["Summary only".to_string()],
+            summary: vec![
+                "**Plan**\n\ndone".to_string(),
+                "**Checking tests**\n\n<!-- -->".to_string(),
+            ],
             content: vec!["Raw reasoning".to_string()],
         },
         "turn-1".to_string(),
@@ -910,7 +950,7 @@ async fn replayed_reasoning_item_hides_raw_reasoning_when_disabled() {
         }
         other => panic!("expected InsertHistoryCell, got {other:?}"),
     };
-    assert!(!rendered.trim().is_empty());
+    assert_eq!(rendered, "• done\n");
     assert!(!rendered.contains("Raw reasoning"));
 }
 
@@ -1045,6 +1085,82 @@ async fn live_reasoning_summary_is_not_rendered_twice_when_item_completes() {
         other => panic!("expected InsertHistoryCell, got {other:?}"),
     };
     assert_eq!(rendered.matches("Summary only").count(), 1);
+}
+
+#[tokio::test]
+async fn live_reasoning_summary_drops_empty_parts_without_losing_content() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.show_welcome_banner = false;
+
+    chat.handle_server_notification(
+        ServerNotification::TurnStarted(TurnStartedNotification {
+            thread_id: "thread-1".to_string(),
+            turn: AppServerTurn {
+                id: "turn-1".to_string(),
+                items_view: codex_app_server_protocol::TurnItemsView::Full,
+                items: Vec::new(),
+                status: AppServerTurnStatus::InProgress,
+                error: None,
+                started_at: Some(0),
+                completed_at: None,
+                duration_ms: None,
+            },
+        }),
+        /*replay_kind*/ None,
+    );
+    let _ = drain_insert_history(&mut rx);
+
+    for (summary_index, delta) in [
+        (0, "**Plan**\n\ndone"),
+        (1, "**Checking tests**\n\n<!-- -->"),
+    ] {
+        chat.handle_server_notification(
+            ServerNotification::ReasoningSummaryPartAdded(
+                codex_app_server_protocol::ReasoningSummaryPartAddedNotification {
+                    thread_id: "thread-1".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    item_id: "reasoning-1".to_string(),
+                    summary_index,
+                },
+            ),
+            /*replay_kind*/ None,
+        );
+        chat.handle_server_notification(
+            ServerNotification::ReasoningSummaryTextDelta(ReasoningSummaryTextDeltaNotification {
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                item_id: "reasoning-1".to_string(),
+                delta: delta.to_string(),
+                summary_index,
+            }),
+            /*replay_kind*/ None,
+        );
+    }
+
+    chat.handle_server_notification(
+        ServerNotification::ItemCompleted(ItemCompletedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            completed_at_ms: 0,
+            item: AppServerThreadItem::Reasoning {
+                id: "reasoning-1".to_string(),
+                summary: vec![
+                    "**Plan**\n\ndone".to_string(),
+                    "**Checking tests**\n\n<!-- -->".to_string(),
+                ],
+                content: Vec::new(),
+            },
+        }),
+        /*replay_kind*/ None,
+    );
+
+    let rendered = match rx.try_recv() {
+        Ok(AppEvent::InsertHistoryCell(cell)) => {
+            lines_to_single_string(&cell.transcript_lines(/*width*/ 80))
+        }
+        other => panic!("expected InsertHistoryCell, got {other:?}"),
+    };
+    assert_eq!(rendered, "• done\n");
 }
 
 #[tokio::test]

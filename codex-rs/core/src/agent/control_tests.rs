@@ -3,6 +3,8 @@ use crate::CodexThread;
 use crate::StateDbHandle;
 use crate::ThreadManager;
 use crate::agent::agent_status_from_event;
+use crate::agent_communication::AgentCommunicationContext;
+use crate::agent_communication::AgentCommunicationKind;
 use crate::config::AgentRoleConfig;
 use crate::config::Config;
 use crate::config::ConfigBuilder;
@@ -17,6 +19,7 @@ use codex_features::Feature;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_protocol::AgentPath;
+use codex_protocol::ResponseItemId;
 use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::config_types::ModeKind;
@@ -49,9 +52,13 @@ use tokio::time::timeout;
 use toml::Value as TomlValue;
 
 async fn test_config_with_cli_overrides(
-    cli_overrides: Vec<(String, TomlValue)>,
+    mut cli_overrides: Vec<(String, TomlValue)>,
 ) -> (TempDir, Config) {
     let home = TempDir::new().expect("create temp dir");
+    cli_overrides.push((
+        "model".to_string(),
+        TomlValue::String("gpt-5.5".to_string()),
+    ));
     let config = ConfigBuilder::without_managed_config_for_tests()
         .codex_home(home.path().to_path_buf())
         .cli_overrides(cli_overrides)
@@ -65,12 +72,11 @@ async fn test_config() -> (TempDir, Config) {
     test_config_with_cli_overrides(Vec::new()).await
 }
 
-fn text_input(text: &str) -> Op {
+fn text_input(text: &str) -> Vec<UserInput> {
     vec![UserInput::Text {
         text: text.to_string(),
         text_elements: Vec::new(),
     }]
-    .into()
 }
 
 fn assistant_message(text: &str, phase: Option<MessagePhase>) -> ResponseItem {
@@ -311,8 +317,7 @@ async fn send_input_errors_when_manager_dropped() {
             vec![UserInput::Text {
                 text: "hello".to_string(),
                 text_elements: Vec::new(),
-            }]
-            .into(),
+            }],
         )
         .await
         .expect_err("send_input should fail without a manager");
@@ -345,7 +350,9 @@ async fn on_event_updates_status_from_task_started() {
 async fn on_event_updates_status_from_task_complete() {
     let status = agent_status_from_event(&EventMsg::TurnComplete(TurnCompleteEvent {
         turn_id: "turn-1".to_string(),
+        started_at: None,
         last_agent_message: Some("done".to_string()),
+        error: None,
         completed_at: None,
         duration_ms: None,
         time_to_first_token_ms: None,
@@ -369,6 +376,7 @@ async fn on_event_updates_status_from_error() {
 async fn on_event_updates_status_from_turn_aborted() {
     let status = agent_status_from_event(&EventMsg::TurnAborted(TurnAbortedEvent {
         turn_id: Some("turn-1".to_string()),
+        started_at: None,
         reason: TurnAbortReason::Interrupted,
         completed_at: None,
         duration_ms: None,
@@ -423,8 +431,7 @@ async fn send_input_errors_when_thread_missing() {
             vec![UserInput::Text {
                 text: "hello".to_string(),
                 text_elements: Vec::new(),
-            }]
-            .into(),
+            }],
         )
         .await
         .expect_err("send_input should fail for missing thread");
@@ -490,8 +497,7 @@ async fn send_input_submits_user_message() {
             vec![UserInput::Text {
                 text: "hello from tests".to_string(),
                 text_elements: Vec::new(),
-            }]
-            .into(),
+            }],
         )
         .await
         .expect("send_input should succeed");
@@ -531,7 +537,11 @@ async fn send_inter_agent_communication_without_turn_queues_message_without_trig
 
     let submission_id = harness
         .control
-        .send_inter_agent_communication(thread_id, communication.clone())
+        .send_inter_agent_communication(
+            thread_id,
+            communication.clone(),
+            AgentCommunicationContext::new(AgentCommunicationKind::Message, ThreadId::new()),
+        )
         .await
         .expect("send_inter_agent_communication should succeed");
     assert!(!submission_id.is_empty());
@@ -656,7 +666,11 @@ async fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent() {
     );
     harness
         .control
-        .send_inter_agent_communication(spawned_agent.thread_id, communication.clone())
+        .send_inter_agent_communication(
+            spawned_agent.thread_id,
+            communication.clone(),
+            AgentCommunicationContext::new(AgentCommunicationKind::Message, ThreadId::new()),
+        )
         .await
         .expect("send_inter_agent_communication should succeed after reload");
     let expected = (
@@ -759,62 +773,6 @@ async fn resume_agent_from_rollout_does_not_reopen_v2_descendants() {
     );
     assert_thread_not_loaded(&resumed_manager, worker_thread_id).await;
     assert_thread_not_loaded(&resumed_manager, reviewer_thread_id).await;
-}
-
-#[tokio::test]
-async fn encrypted_inter_agent_communication_clears_existing_last_task_message() {
-    let harness = AgentControlHarness::new().await;
-    let (parent_thread_id, _) = harness.start_thread().await;
-    let agent_path = AgentPath::try_from("/root/worker").expect("agent path");
-    let spawned_agent = harness
-        .control
-        .spawn_agent_with_metadata(
-            harness.config.clone(),
-            text_input("old plaintext task"),
-            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-                parent_thread_id,
-                depth: 1,
-                agent_path: Some(agent_path.clone()),
-                agent_nickname: None,
-                agent_role: None,
-            })),
-            SpawnAgentOptions {
-                parent_thread_id: Some(parent_thread_id),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("spawn_agent should succeed");
-    assert_eq!(
-        harness
-            .control
-            .state
-            .agent_metadata_for_thread(spawned_agent.thread_id)
-            .and_then(|metadata| metadata.last_task_message),
-        Some("old plaintext task".to_string())
-    );
-
-    let communication = InterAgentCommunication::new_encrypted(
-        AgentPath::root(),
-        agent_path,
-        Vec::new(),
-        "encrypted-task".to_string(),
-        /*trigger_turn*/ true,
-    );
-    harness
-        .control
-        .send_inter_agent_communication(spawned_agent.thread_id, communication)
-        .await
-        .expect("send_inter_agent_communication should succeed");
-
-    assert_eq!(
-        harness
-            .control
-            .state
-            .agent_metadata_for_thread(spawned_agent.thread_id)
-            .and_then(|metadata| metadata.last_task_message),
-        None
-    );
 }
 
 #[tokio::test]
@@ -962,7 +920,7 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
                 assistant_message("parent final answer", Some(MessagePhase::FinalAnswer)),
                 assistant_message("parent unknown phase", /*phase*/ None),
                 ResponseItem::Reasoning {
-                    id: Some("parent-reasoning".to_string()),
+                    id: Some(ResponseItemId::with_suffix("rs", "parent-reasoning")),
                     summary: Vec::new(),
                     content: None,
                     encrypted_content: None,
@@ -2011,7 +1969,9 @@ async fn multi_agent_v2_completion_ignores_dead_direct_parent() {
             tester_turn.as_ref(),
             EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: tester_turn.sub_id.clone(),
+                started_at: None,
                 last_agent_message: Some("done".to_string()),
+                error: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -2098,7 +2058,9 @@ async fn multi_agent_v2_completion_queues_message_for_direct_parent() {
             tester_turn.as_ref(),
             EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: tester_turn.sub_id.clone(),
+                started_at: None,
                 last_agent_message: Some("done".to_string()),
+                error: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -2371,9 +2333,12 @@ async fn spawn_thread_subagent_uses_role_specific_nickname_candidates() {
 async fn resume_thread_subagent_restores_stored_metadata() {
     let (home, config) = test_config().await;
     let thread_store = Arc::new(InMemoryThreadStore::default());
+    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy"));
     let manager = ThreadManager::new(
         &config,
-        AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy")),
+        auth_manager.clone(),
+        crate::thread_manager::build_models_manager(&config, auth_manager),
+        crate::CodexAppsToolsCache::default(),
         SessionSource::Exec,
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
         empty_extension_registry(),

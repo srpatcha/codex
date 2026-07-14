@@ -1,3 +1,4 @@
+use crate::CodexAppsToolsCache;
 use crate::SkillsService;
 use crate::agent::AgentControl;
 use crate::attestation::AttestationProvider;
@@ -305,6 +306,8 @@ impl ThreadManager {
     pub fn new(
         config: &Config,
         auth_manager: Arc<AuthManager>,
+        models_manager: SharedModelsManager,
+        codex_apps_tools_cache: CodexAppsToolsCache,
         session_source: SessionSource,
         environment_manager: Arc<EnvironmentManager>,
         extensions: Arc<ExtensionRegistry<Config>>,
@@ -327,6 +330,7 @@ impl ThreadManager {
         let mcp_manager = Arc::new(McpManager::new_with_extensions(
             Arc::clone(&plugins_manager),
             Arc::clone(&extensions),
+            codex_apps_tools_cache,
         ));
         let skills_service = Arc::new(SkillsService::new_with_restriction_product(
             codex_home,
@@ -337,7 +341,7 @@ impl ThreadManager {
             state: Arc::new(ThreadManagerState {
                 threads: Arc::new(RwLock::new(HashMap::new())),
                 thread_created_tx,
-                models_manager: build_models_manager(config, auth_manager.clone()),
+                models_manager,
                 environment_manager,
                 skills_service,
                 plugins_manager,
@@ -362,6 +366,16 @@ impl ThreadManager {
             }),
             _test_codex_home_guard: None,
         }
+    }
+
+    pub(crate) fn with_code_mode_host_program_for_tests(mut self, host_program: PathBuf) -> Self {
+        let Some(state) = Arc::get_mut(&mut self.state) else {
+            unreachable!("new thread manager state should not be shared");
+        };
+        state.code_mode_session_provider = Arc::new(
+            ProcessOwnedCodeModeSessionProvider::with_host_program(host_program),
+        );
+        self
     }
 
     /// Construct with a dummy AuthManager containing the provided CodexAuth.
@@ -499,8 +513,13 @@ impl ThreadManager {
     pub fn default_environment_selections(
         &self,
         cwd: &AbsolutePathBuf,
+        workspace_roots: &[AbsolutePathBuf],
     ) -> Vec<TurnEnvironmentSelection> {
-        default_thread_environment_selections(self.state.environment_manager.as_ref(), cwd)
+        default_thread_environment_selections(
+            self.state.environment_manager.as_ref(),
+            cwd,
+            workspace_roots,
+        )
     }
 
     pub fn validate_environment_selections(
@@ -532,10 +551,14 @@ impl ThreadManager {
         self.state.models_manager.clone()
     }
 
-    pub async fn list_models(&self, refresh_strategy: RefreshStrategy) -> Vec<ModelPreset> {
+    pub async fn list_models(
+        &self,
+        refresh_strategy: RefreshStrategy,
+        http_client_factory: codex_http_client::HttpClientFactory,
+    ) -> Vec<ModelPreset> {
         self.state
             .models_manager
-            .list_models(refresh_strategy)
+            .list_models(refresh_strategy, http_client_factory)
             .await
     }
 
@@ -644,6 +667,7 @@ impl ThreadManager {
         let environments = default_thread_environment_selections(
             self.state.environment_manager.as_ref(),
             &config.cwd,
+            &config.workspace_roots,
         );
         Box::pin(self.start_thread_with_options(StartThreadOptions {
             config,
@@ -775,10 +799,19 @@ impl ThreadManager {
         let environments = default_thread_environment_selections(
             self.state.environment_manager.as_ref(),
             &config.cwd,
+            &config.workspace_roots,
         );
         let (session_source, thread_source) = initial_history
             .get_resumed_session_sources()
             .unwrap_or_else(|| (self.state.session_source.clone(), None));
+        if let InitialHistory::Resumed(resumed) = &initial_history
+            && initial_history.get_multi_agent_version() == Some(MultiAgentVersion::V2)
+            && !session_source.is_non_root_agent()
+        {
+            agent_control
+                .restore_v2_agent_metadata(&config, resumed.conversation_id)
+                .await;
+        }
         Box::pin(self.state.spawn_thread_with_source(
             config,
             initial_history,
@@ -813,6 +846,7 @@ impl ThreadManager {
         let environments = default_thread_environment_selections(
             self.state.environment_manager.as_ref(),
             &config.cwd,
+            &config.workspace_roots,
         );
         Box::pin(self.state.spawn_thread(
             config,
@@ -846,6 +880,7 @@ impl ThreadManager {
         let environments = default_thread_environment_selections(
             self.state.environment_manager.as_ref(),
             &config.cwd,
+            &config.workspace_roots,
         );
         let (session_source, thread_source) = initial_history
             .get_resumed_session_sources()
@@ -1034,6 +1069,7 @@ impl ThreadManager {
         let environments = default_thread_environment_selections(
             self.state.environment_manager.as_ref(),
             &config.cwd,
+            &config.workspace_roots,
         );
         let agent_control = self.agent_control_for_config(&config);
         Box::pin(self.state.spawn_thread(
@@ -1350,7 +1386,11 @@ impl ThreadManagerState {
         environments: Option<Vec<TurnEnvironmentSelection>>,
     ) -> CodexResult<NewThread> {
         let environments = environments.unwrap_or_else(|| {
-            default_thread_environment_selections(self.environment_manager.as_ref(), &config.cwd)
+            default_thread_environment_selections(
+                self.environment_manager.as_ref(),
+                &config.cwd,
+                &config.workspace_roots,
+            )
         });
         Box::pin(self.spawn_thread_with_source(
             config,
@@ -1389,8 +1429,11 @@ impl ThreadManagerState {
             inherited_environments,
             inherited_exec_policy,
         } = options;
-        let environments =
-            default_thread_environment_selections(self.environment_manager.as_ref(), &config.cwd);
+        let environments = default_thread_environment_selections(
+            self.environment_manager.as_ref(),
+            &config.cwd,
+            &config.workspace_roots,
+        );
         let thread_source = initial_history.get_resumed_thread_source();
         Box::pin(self.spawn_thread_with_source(
             config,
@@ -1432,7 +1475,11 @@ impl ThreadManagerState {
         thread_extension_init: ExtensionDataInit,
     ) -> CodexResult<NewThread> {
         let environments = environments.unwrap_or_else(|| {
-            default_thread_environment_selections(self.environment_manager.as_ref(), &config.cwd)
+            default_thread_environment_selections(
+                self.environment_manager.as_ref(),
+                &config.cwd,
+                &config.workspace_roots,
+            )
         });
         Box::pin(self.spawn_thread_with_source(
             config,
@@ -1772,6 +1819,7 @@ fn truncate_before_nth_user_message(
 struct SnapshotTurnState {
     ends_mid_turn: bool,
     active_turn_id: Option<String>,
+    active_turn_started_at: Option<i64>,
     active_turn_start_index: Option<usize>,
 }
 
@@ -1791,6 +1839,7 @@ fn snapshot_turn_state(history: &InitialHistory) -> SnapshotTurnState {
             return SnapshotTurnState {
                 ends_mid_turn: false,
                 active_turn_id: None,
+                active_turn_started_at: None,
                 active_turn_start_index: None,
             };
         }
@@ -1798,6 +1847,7 @@ fn snapshot_turn_state(history: &InitialHistory) -> SnapshotTurnState {
         return SnapshotTurnState {
             ends_mid_turn: true,
             active_turn_id,
+            active_turn_started_at: active_turn_snapshot.and_then(|turn| turn.started_at),
             active_turn_start_index: builder.active_turn_start_index(),
         };
     }
@@ -1809,6 +1859,7 @@ fn snapshot_turn_state(history: &InitialHistory) -> SnapshotTurnState {
         return SnapshotTurnState {
             ends_mid_turn: false,
             active_turn_id: None,
+            active_turn_started_at: None,
             active_turn_start_index: None,
         };
     };
@@ -1824,6 +1875,7 @@ fn snapshot_turn_state(history: &InitialHistory) -> SnapshotTurnState {
             )
         }),
         active_turn_id: None,
+        active_turn_started_at: None,
         active_turn_start_index: None,
     }
 }
@@ -1851,6 +1903,7 @@ fn fork_history_from_snapshot(
                 append_interrupted_boundary(
                     history,
                     snapshot_state.active_turn_id,
+                    snapshot_state.active_turn_started_at,
                     interrupted_marker,
                 )
             } else {
@@ -1866,11 +1919,13 @@ fn fork_history_from_snapshot(
 fn append_interrupted_boundary(
     history: InitialHistory,
     turn_id: Option<String>,
+    started_at: Option<i64>,
     interrupted_marker: InterruptedTurnHistoryMarker,
 ) -> InitialHistory {
     let aborted_event = RolloutItem::EventMsg(EventMsg::TurnAborted(TurnAbortedEvent {
         turn_id,
         reason: TurnAbortReason::Interrupted,
+        started_at,
         completed_at: None,
         duration_ms: None,
     }));
