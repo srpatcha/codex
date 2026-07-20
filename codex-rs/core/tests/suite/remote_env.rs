@@ -7,8 +7,13 @@ use codex_core::compact::SUMMARIZATION_PROMPT;
 use codex_core::config::Constrained;
 use codex_exec_server::CopyOptions;
 use codex_exec_server::CreateDirectoryOptions;
+use codex_exec_server::EnvironmentReadyInfo;
+use codex_exec_server::ExecServerError;
 use codex_exec_server::FileSystemSandboxContext;
 use codex_exec_server::LOCAL_ENVIRONMENT_ID;
+use codex_exec_server::NoiseChannelPublicKey;
+use codex_exec_server::NoiseRendezvousConnectBundle;
+use codex_exec_server::NoiseRendezvousConnectProvider;
 use codex_exec_server::REMOTE_ENVIRONMENT_ID;
 use codex_exec_server::RemoveOptions;
 use codex_features::Feature;
@@ -23,6 +28,7 @@ use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::ENVIRONMENTS_INSTRUCTIONS_OPEN_TAG;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ReviewDecision;
@@ -58,6 +64,7 @@ use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::skip_if_no_remote_env;
 use core_test_support::skip_if_target_windows;
+use core_test_support::submit_thread_settings;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::local;
 use core_test_support::test_codex::test_codex;
@@ -69,6 +76,7 @@ use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_match;
 use futures::SinkExt;
 use futures::StreamExt;
+use futures::future::BoxFuture;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
@@ -76,6 +84,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -327,32 +338,161 @@ async fn explicit_remote_shell_runs_in_remote_cwd() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn deferred_executor_does_not_duplicate_initial_environment_context() -> Result<()> {
+async fn step_world_state_does_not_duplicate_initial_environment_context() -> Result<()> {
+    for deferred_executor_enabled in [false, true] {
+        let server = start_mock_server().await;
+        let response_mock = mount_sse_once(
+            &server,
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_assistant_message("msg-1", "done"),
+                ev_completed("resp-1"),
+            ]),
+        )
+        .await;
+        let mut builder = test_codex().with_config(move |config| {
+            if deferred_executor_enabled {
+                assert!(config.features.enable(Feature::DeferredExecutor).is_ok());
+            }
+        });
+        let test = builder.build(&server).await?;
+
+        test.submit_turn("report the environment").await?;
+
+        let user_context = response_mock.single_request().message_input_texts("user");
+        assert_eq!(
+            user_context
+                .iter()
+                .filter(|text| text.contains("<environment_context>"))
+                .count(),
+            1,
+            "deferred executor enabled: {deferred_executor_enabled}",
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn settings_update_does_not_retarget_active_turn_environment() -> Result<()> {
     let server = start_mock_server().await;
-    let response_mock = mount_sse_once(
+    let response_mock = mount_sse_sequence(
         &server,
-        sse(vec![
-            ev_response_created("resp-1"),
-            ev_assistant_message("msg-1", "done"),
-            ev_completed("resp-1"),
-        ]),
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_function_call(
+                    "pause-turn",
+                    "request_user_input",
+                    &json!({
+                        "questions": [{
+                            "id": "continue",
+                            "header": "Continue",
+                            "question": "Continue after settings update?",
+                            "options": [{
+                                "label": "Yes (Recommended)",
+                                "description": "Continue the test."
+                            }, {
+                                "label": "No",
+                                "description": "Stop the test."
+                            }]
+                        }]
+                    })
+                    .to_string(),
+                ),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-2"),
+                ev_assistant_message("msg-2", "first turn done"),
+                ev_completed("resp-2"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-3"),
+                ev_assistant_message("msg-3", "second turn done"),
+                ev_completed("resp-3"),
+            ]),
+        ],
     )
     .await;
     let mut builder = test_codex().with_config(|config| {
         assert!(config.features.enable(Feature::DeferredExecutor).is_ok());
+        assert!(
+            config
+                .features
+                .enable(Feature::DefaultModeRequestUserInput)
+                .is_ok()
+        );
     });
     let test = builder.build(&server).await?;
+    let initial_cwd = test.config.cwd.clone();
+    let next_workspace = TempDir::new()?;
+    let next_cwd = next_workspace.path().abs();
 
-    test.submit_turn("report the environment").await?;
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "pause before continuing".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+    let request = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::RequestUserInput(request) => Some(request.clone()),
+        _ => None,
+    })
+    .await;
 
-    let user_context = response_mock.single_request().message_input_texts("user");
+    submit_thread_settings(
+        &test.codex,
+        ThreadSettingsOverrides {
+            environments: Some(TurnEnvironmentSelections::new(
+                next_cwd.clone(),
+                vec![local(next_cwd.clone())],
+            )),
+            ..Default::default()
+        },
+    )
+    .await?;
+    test.codex
+        .submit(Op::UserInputAnswer {
+            id: request.turn_id,
+            response: RequestUserInputResponse {
+                answers: HashMap::from([(
+                    "continue".to_string(),
+                    RequestUserInputAnswer {
+                        answers: vec!["Yes (Recommended)".to_string()],
+                    },
+                )]),
+            },
+        })
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    test.submit_turn("start the next turn").await?;
+
+    let request_texts = response_mock
+        .requests()
+        .iter()
+        .map(|request| request.message_input_texts("user").join("\n"))
+        .collect::<Vec<_>>();
+    let initial_cwd = format!("<cwd>{}</cwd>", initial_cwd.as_path().display());
+    let next_cwd = format!("<cwd>{}</cwd>", next_cwd.as_path().display());
     assert_eq!(
-        user_context
+        request_texts
             .iter()
-            .filter(|text| text.contains("<environment_context>"))
-            .count(),
-        1
+            .map(|text| text.contains(&next_cwd))
+            .collect::<Vec<_>>(),
+        vec![false, false, true]
     );
+    assert!(request_texts[0].contains(&initial_cwd));
+    assert!(request_texts[1].contains(&initial_cwd));
 
     Ok(())
 }
@@ -483,6 +623,25 @@ fn tool_names(body: &Value) -> Vec<String> {
         .collect()
 }
 
+#[derive(Default)]
+struct FailingNoiseConnectProvider {
+    calls: AtomicUsize,
+}
+
+impl NoiseRendezvousConnectProvider for FailingNoiseConnectProvider {
+    fn connect_bundle(
+        &self,
+        _: NoiseChannelPublicKey,
+    ) -> BoxFuture<'_, std::result::Result<NoiseRendezvousConnectBundle, ExecServerError>> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async {
+            Err(ExecServerError::Protocol(
+                "test Noise connection failed".to_string(),
+            ))
+        })
+    }
+}
+
 async fn wait_for_response_request_count(response_mock: &ResponseMock, expected_count: usize) {
     timeout(Duration::from_secs(5), async {
         while response_mock.requests().len() < expected_count {
@@ -494,8 +653,7 @@ async fn wait_for_response_request_count(response_mock: &ResponseMock, expected_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn deferred_executor_updates_context_and_tools_after_startup() -> Result<()> {
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
+async fn deferred_executor_starts_noise_connection_after_registration() -> Result<()> {
     let server = start_mock_server().await;
     let wait_call_id = "wait-for-startup";
     let response_mock = mount_sse_sequence(
@@ -515,47 +673,24 @@ async fn deferred_executor_updates_context_and_tools_after_startup() -> Result<(
             ]),
             sse(vec![
                 ev_response_created("resp-2"),
-                ev_function_call(
-                    "request-permissions",
-                    "request_permissions",
-                    &json!({
-                        "reason": "Verify that the ready environment is used.",
-                        "permissions": {
-                            "network": { "enabled": true }
-                        }
-                    })
-                    .to_string(),
-                ),
+                ev_assistant_message("msg-2", "done"),
                 ev_completed("resp-2"),
-            ]),
-            sse(vec![
-                ev_response_created("resp-3"),
-                ev_assistant_message("msg-3", "done"),
-                ev_completed("resp-3"),
             ]),
         ],
     )
     .await;
     let mut builder = test_codex().with_config(|config| {
-        config.project_doc_max_bytes = 0;
         config.use_experimental_unified_exec_tool = true;
-        config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
-        config.approvals_reviewer = ApprovalsReviewer::User;
         assert!(config.features.enable(Feature::DeferredExecutor).is_ok());
         assert!(config.features.enable(Feature::UnifiedExec).is_ok());
-        assert!(
-            config
-                .features
-                .enable(Feature::RequestPermissionsTool)
-                .is_ok()
-        );
     });
     let test = timeout(Duration::from_secs(5), builder.build(&server))
         .await
         .context("thread startup should not wait for the remote environment")??;
     let environment_manager = test.thread_manager.environment_manager();
-    let registration =
-        environment_manager.register_pending_environment(REMOTE_ENVIRONMENT_ID.to_string())?;
+    let provider = Arc::new(FailingNoiseConnectProvider::default());
+    let registration = environment_manager
+        .register_deferred_noise_environment(REMOTE_ENVIRONMENT_ID.to_string(), provider.clone())?;
 
     test.codex
         .submit(Op::UserInput {
@@ -581,83 +716,26 @@ async fn deferred_executor_updates_context_and_tools_after_startup() -> Result<(
         .await?;
     wait_for_response_request_count(&response_mock, /*expected_count*/ 1).await;
     assert_eq!(response_mock.requests().len(), 1);
-    registration.complete(Ok(format!("ws://{}", listener.local_addr()?)))?;
-    serve_environment_info(listener).await;
-    let event = wait_for_event(&test.codex, |event| {
-        matches!(
-            event,
-            EventMsg::RequestPermissions(_) | EventMsg::TurnComplete(_)
-        )
-    })
-    .await;
-    let EventMsg::RequestPermissions(permission_request) = event else {
-        panic!("ready environment should be available to request_permissions: {event:?}");
-    };
-    assert_eq!(
-        permission_request.environment_id.as_deref(),
-        Some(REMOTE_ENVIRONMENT_ID)
-    );
-    test.codex
-        .submit(Op::RequestPermissionsResponse {
-            id: permission_request.call_id,
-            response: RequestPermissionsResponse {
-                permissions: RequestPermissionProfile::default(),
-                scope: PermissionGrantScope::Turn,
-                strict_auto_review: false,
-            },
-        })
-        .await?;
+    assert_eq!(provider.calls.load(Ordering::Relaxed), 0);
+    registration.complete(Ok(EnvironmentReadyInfo::default()))?;
     wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))
     })
     .await;
+    assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
 
     let requests = response_mock.requests();
-    assert_eq!(requests.len(), 3);
+    assert_eq!(requests.len(), 2);
     let starting_tools = tool_names(&requests[0].body_json());
-    let ready_tools = tool_names(&requests[1].body_json());
     assert!(starting_tools.contains(&"wait_for_environment".to_string()));
     assert!(!starting_tools.contains(&"exec_command".to_string()));
-    assert!(ready_tools.contains(&"exec_command".to_string()));
-    assert!(ready_tools.contains(&"wait_for_environment".to_string()));
     let (wait_output, _) = requests[1]
         .function_call_output_content_and_success(wait_call_id)
         .context("wait_for_environment output should be present")?;
-    assert_eq!(
-        serde_json::from_str::<Value>(&wait_output.context("wait output should contain text")?)?,
-        json!({
-            "environment_id": REMOTE_ENVIRONMENT_ID,
-            "status": "ready",
-        })
-    );
     assert!(
-        requests[0]
-            .message_input_texts("user")
-            .iter()
-            .any(|text| text.contains("<status>starting</status>"))
-    );
-    let ready_user_context = requests[1].message_input_texts("user");
-    assert_eq!(
-        ready_user_context
-            .iter()
-            .filter(|text| text.contains("<shell>zsh</shell>"))
-            .count(),
-        1
-    );
-    let final_user_context = requests[2].message_input_texts("user");
-    assert_eq!(
-        final_user_context
-            .iter()
-            .filter(|text| text.contains("<status>starting</status>"))
-            .count(),
-        1
-    );
-    assert_eq!(
-        final_user_context
-            .iter()
-            .filter(|text| text.contains("<shell>zsh</shell>"))
-            .count(),
-        1
+        wait_output
+            .context("wait output should contain text")?
+            .contains("failed to start")
     );
 
     Ok(())
@@ -743,6 +821,9 @@ async fn deferred_executor_loads_agents_md_when_environment_becomes_ready() -> R
     assert_eq!(agents_md_occurrences(&requests[0], AGENTS_CONTENT), 0);
     assert_eq!(agents_md_occurrences(&requests[1], AGENTS_CONTENT), 1);
     assert_eq!(agents_md_occurrences(&requests[2], AGENTS_CONTENT), 1);
+    assert_eq!(environment_instructions_occurrences(&requests[0]), 1);
+    assert_eq!(environment_instructions_occurrences(&requests[1]), 1);
+    assert_eq!(environment_instructions_occurrences(&requests[2]), 1);
     assert_eq!(test.codex.instruction_sources().await, vec![agents_path]);
 
     Ok(())
@@ -753,6 +834,14 @@ fn agents_md_occurrences(request: &ResponsesRequest, contents: &str) -> usize {
         .message_input_texts("user")
         .iter()
         .filter(|text| text.contains(contents))
+        .count()
+}
+
+fn environment_instructions_occurrences(request: &ResponsesRequest) -> usize {
+    request
+        .message_input_texts("developer")
+        .iter()
+        .filter(|text| text.contains(ENVIRONMENTS_INSTRUCTIONS_OPEN_TAG))
         .count()
 }
 
@@ -792,8 +881,10 @@ async fn deferred_executor_wait_reports_startup_failure() -> Result<()> {
         .await
         .context("thread startup should not wait for the remote environment")??;
     let environment_manager = test.thread_manager.environment_manager();
-    let registration =
-        environment_manager.register_pending_environment(REMOTE_ENVIRONMENT_ID.to_string())?;
+    let registration = environment_manager.register_deferred_noise_environment(
+        REMOTE_ENVIRONMENT_ID.to_string(),
+        Arc::new(FailingNoiseConnectProvider::default()),
+    )?;
 
     test.codex
         .submit(Op::UserInput {
