@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 #![allow(clippy::expect_used)]
 
+use codex_utils_absolute_path::test_support::PathExt;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::PoisonError;
@@ -1134,6 +1135,7 @@ async fn installed_tools_with_start(
                 session_source: &session_source,
                 persistent_thread_state_available,
                 environments: &[],
+                mcp_resource_client: None,
                 session_store: &session_store,
                 thread_store: &thread_store,
             })
@@ -1187,6 +1189,7 @@ impl GoalExtensionHarness {
                     session_source: &session_source,
                     persistent_thread_state_available: true,
                     environments: &[],
+                    mcp_resource_client: None,
                     session_store: &session_store,
                     thread_store: &thread_store,
                 })
@@ -1356,7 +1359,11 @@ fn tool_call(tool_name: &str, call_id: &str, arguments: serde_json::Value) -> To
 
 async fn test_runtime() -> anyhow::Result<Arc<codex_state::StateRuntime>> {
     let tempdir = TempDir::new()?;
-    codex_state::StateRuntime::init(tempdir.keep(), "test-provider".to_string()).await
+    codex_state::StateRuntime::init(
+        codex_state::SqliteConfig::new_for_testing(tempdir.keep().as_path().abs()),
+        "test-provider".to_string(),
+    )
+    .await
 }
 
 fn test_thread_id() -> anyhow::Result<ThreadId> {
@@ -1370,7 +1377,8 @@ async fn seed_thread_metadata(
     let builder = codex_state::ThreadMetadataBuilder::new(
         thread_id,
         runtime
-            .codex_home()
+            .sqlite()
+            .home()
             .join(format!("rollout-{thread_id}.jsonl")),
         chrono::Utc::now(),
         SessionSource::Cli,
