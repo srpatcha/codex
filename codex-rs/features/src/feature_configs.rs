@@ -6,6 +6,14 @@ use std::collections::BTreeMap;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct ToolRegistryConfigToml {
+    /// Fail the turn when multiple tools share the same effective name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_on_tool_collisions: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CodeModeConfigToml {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
@@ -20,6 +28,26 @@ pub struct CodeModeConfigToml {
 }
 
 impl FeatureConfig for CodeModeConfigToml {
+    fn enabled(&self) -> Option<bool> {
+        self.enabled
+    }
+
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = Some(enabled);
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CodeModeHostConfigToml {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Keep code mode fail-closed when the standalone host is unavailable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disable_in_process_fallback: Option<bool>,
+}
+
+impl FeatureConfig for CodeModeHostConfigToml {
     fn enabled(&self) -> Option<bool> {
         self.enabled
     }
@@ -75,6 +103,9 @@ pub struct MultiAgentV2ConfigToml {
     pub root_agent_usage_hint_text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subagent_usage_hint_text: Option<String>,
+    /// Overrides inherited developer instructions for subagents without role-specific instructions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subagent_developer_instructions: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub multi_agent_mode_hint_text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -103,11 +134,23 @@ impl FeatureConfig for MultiAgentV2ConfigToml {
     }
 }
 
+/// Identity included in the context-window developer message.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenBudgetMode {
+    #[default]
+    Thread,
+    Name,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TokenBudgetConfigToml {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+    /// Select whether context-window metadata identifies the thread or agent name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<TokenBudgetMode>,
     /// Number of tokens remaining before auto-compaction when the wrap-up reminder is emitted.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]

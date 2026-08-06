@@ -2,6 +2,7 @@ use super::*;
 use crate::config::test_config;
 use crate::init_state_db;
 use crate::installation_id::INSTALLATION_ID_FILENAME;
+use crate::mcp::McpThreadIdentity;
 use crate::rollout::RolloutRecorder;
 use crate::session::session::SessionSettingsUpdate;
 use crate::session::tests::build_world_state_from_turn_context;
@@ -13,6 +14,9 @@ use codex_models_manager::manager::RefreshStrategy;
 use codex_protocol::ResponseItemId;
 use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
+use codex_protocol::mcp::ClientMcpExtensions;
+use codex_protocol::mcp::MCP_APP_UI_EXTENSION_ID;
+use codex_protocol::mcp::OPENAI_FORM_EXTENSION_ID;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::models::ResponseItem;
@@ -24,6 +28,7 @@ use codex_protocol::protocol::ResumedHistory;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::UserMessageEvent;
@@ -38,6 +43,52 @@ use tempfile::tempdir;
 use wiremock::MockServer;
 
 const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
+
+#[tokio::test]
+async fn child_session_inherits_client_mcp_extensions() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let parent = manager
+        .start_thread(StartThreadOptions {
+            client_mcp_extensions: ClientMcpExtensions::new(HashMap::from([
+                (OPENAI_FORM_EXTENSION_ID.to_string(), serde_json::json!({})),
+                (
+                    MCP_APP_UI_EXTENSION_ID.to_string(),
+                    serde_json::json!({
+                        "mimeTypes": ["text/html;profile=mcp-app"],
+                    }),
+                ),
+            ])),
+            ..StartThreadOptions::new(config)
+        })
+        .await
+        .expect("start parent thread");
+
+    assert_eq!(
+        manager
+            .state
+            .client_mcp_extensions_for_child(Some(parent.thread_id))
+            .await,
+        ClientMcpExtensions::new(HashMap::from([
+            (OPENAI_FORM_EXTENSION_ID.to_string(), serde_json::json!({})),
+            (
+                MCP_APP_UI_EXTENSION_ID.to_string(),
+                serde_json::json!({
+                    "mimeTypes": ["text/html;profile=mcp-app"],
+                }),
+            ),
+        ]))
+    );
+}
 
 struct FakeAgentGraphStore {
     root_thread_id: ThreadId,
@@ -203,6 +254,7 @@ fn truncates_before_requested_user_message() {
             name: "tool".to_string(),
             namespace: None,
             arguments: "{}".to_string(),
+            encrypted_function_args: None,
             internal_chat_message_metadata_passthrough: None,
         },
         assistant_msg("a4"),
@@ -428,7 +480,7 @@ async fn code_mode_session_provider_is_shared_across_threads() {
     config.cwd = config.codex_home.abs();
     std::fs::create_dir_all(&config.codex_home).expect("create codex home");
 
-    let provider: Arc<dyn CodeModeSessionProvider> = Arc::new(InProcessCodeModeSessionProvider);
+    let provider: Arc<dyn CodeModeSessionProvider> = Arc::new(DisabledCodeModeSessionProvider);
     let manager = ThreadManager::with_models_provider_and_home_for_tests(
         CodexAuth::from_api_key("dummy"),
         config.model_provider.clone(),
@@ -480,6 +532,102 @@ async fn code_mode_session_provider_is_shared_across_threads() {
 }
 
 #[tokio::test]
+async fn mcp_invalidation_refreshes_threads_that_are_still_starting() {
+    struct BlockingThreadStartup {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        refreshed: tokio::sync::Notify,
+        projections: std::sync::atomic::AtomicUsize,
+    }
+
+    impl codex_extension_api::ThreadLifecycleContributor<Config> for BlockingThreadStartup {
+        fn on_thread_start<'a>(
+            &'a self,
+            _input: codex_extension_api::ThreadStartInput<'a, Config>,
+        ) -> codex_extension_api::ExtensionFuture<'a, ()> {
+            Box::pin(async move {
+                self.entered.notify_one();
+                self.release.notified().await;
+            })
+        }
+    }
+
+    impl codex_extension_api::McpServerContributor<Config> for BlockingThreadStartup {
+        fn id(&self) -> &'static str {
+            "starting_mcp_runtime_refresh_test"
+        }
+
+        fn contribute<'a>(
+            &'a self,
+            _context: codex_extension_api::McpServerContributionContext<'a, Config>,
+        ) -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::McpServerContribution>>
+        {
+            Box::pin(async move {
+                if self.projections.fetch_add(1, Ordering::AcqRel) != 0 {
+                    self.refreshed.notify_one();
+                }
+                Vec::new()
+            })
+        }
+    }
+
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+
+    let observer = Arc::new(BlockingThreadStartup {
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        refreshed: tokio::sync::Notify::new(),
+        projections: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let mut extensions = codex_extension_api::ExtensionRegistryBuilder::new();
+    extensions.thread_lifecycle_contributor(observer.clone());
+    extensions.mcp_server_contributor(observer.clone());
+    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy"));
+    let manager = Arc::new(ThreadManager::new(
+        &config,
+        Arc::clone(&auth_manager),
+        build_models_manager(&config, auth_manager),
+        crate::CodexAppsToolsCache::default(),
+        SessionSource::Exec,
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        Arc::new(extensions.build()),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+        /*analytics_events_client*/ None,
+        thread_store_from_config(&config, /*state_db*/ None),
+        /*agent_graph_store*/ None,
+        TEST_INSTALLATION_ID.to_string(),
+        /*attestation_provider*/ None,
+        /*external_time_provider*/ None,
+    ));
+    let starting = tokio::spawn({
+        let manager = Arc::clone(&manager);
+        async move { manager.start_thread(StartThreadOptions::new(config)).await }
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), observer.entered.notified())
+        .await
+        .expect("thread should enter its startup lifecycle");
+    assert!(manager.list_thread_ids().await.is_empty());
+    manager.invalidate_mcp_runtimes().await;
+    observer.release.notify_one();
+    starting
+        .await
+        .expect("thread startup task should finish")
+        .expect("thread should start");
+    tokio::time::timeout(Duration::from_secs(5), observer.refreshed.notified())
+        .await
+        .expect("invalidation during startup should refresh the newly published thread");
+    let shutdown = manager
+        .shutdown_all_threads_bounded(Duration::from_secs(5))
+        .await;
+    assert!(shutdown.timed_out.is_empty());
+}
+
+#[tokio::test]
 async fn start_thread_keeps_internal_threads_hidden_from_normal_lookups() {
     let temp_dir = tempdir().expect("tempdir");
     let mut config = test_config().await;
@@ -520,7 +668,7 @@ async fn start_thread_keeps_internal_threads_hidden_from_normal_lookups() {
 async fn start_thread_seeds_extension_data_for_mcp_and_lifecycle_contributors() {
     struct InitialDataRecorder {
         lifecycle_observed: Arc<std::sync::Mutex<Vec<(String, String)>>>,
-        mcp_observed: Arc<std::sync::Mutex<Vec<String>>>,
+        mcp_observed: Arc<std::sync::Mutex<Vec<(String, SessionSource)>>>,
     }
 
     impl codex_extension_api::ThreadLifecycleContributor<Config> for InitialDataRecorder {
@@ -566,7 +714,13 @@ async fn start_thread_seeds_extension_data_for_mcp_and_lifecycle_contributors() 
                 self.mcp_observed
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push(selected_root.id.clone());
+                    .push((
+                        selected_root.id.clone(),
+                        context
+                            .session_source()
+                            .expect("thread-scoped MCP resolution should identify its source")
+                            .clone(),
+                    ));
                 let mut server = codex_mcp::codex_apps_mcp_server_config(
                     "https://selected.invalid",
                     /*apps_mcp_product_sku*/ None,
@@ -646,9 +800,11 @@ async fn start_thread_seeds_extension_data_for_mcp_and_lifecycle_contributors() 
         })
         .await
         .expect("start first thread");
+    let second_session_source = SessionSource::SubAgent(SubAgentSource::Review);
     let second_thread = manager
         .start_thread(StartThreadOptions {
             environments: Some(Vec::new()),
+            session_source: Some(second_session_source.clone()),
             thread_extension_init: selected_root_init("selected-b", "env-b"),
             ..StartThreadOptions::new(config.clone())
         })
@@ -663,7 +819,10 @@ async fn start_thread_seeds_extension_data_for_mcp_and_lifecycle_contributors() 
             &config,
             &first_session.services.mcp_thread_init,
             &first_session.services.thread_extension_data,
-            &first_originator,
+            McpThreadIdentity {
+                session_source: &SessionSource::Exec,
+                originator: &first_originator,
+            },
             /*ready_selected_capability_roots*/ &[],
             /*executor_capability_discovery*/ None,
         )
@@ -677,7 +836,10 @@ async fn start_thread_seeds_extension_data_for_mcp_and_lifecycle_contributors() 
             &config,
             &second_session.services.mcp_thread_init,
             &second_session.services.thread_extension_data,
-            &second_originator,
+            McpThreadIdentity {
+                session_source: &second_session_source,
+                originator: &second_originator,
+            },
             /*ready_selected_capability_roots*/ &[],
             /*executor_capability_discovery*/ None,
         )
@@ -700,10 +862,10 @@ async fn start_thread_seeds_extension_data_for_mcp_and_lifecycle_contributors() 
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner),
         vec![
-            "selected-a".to_string(),
-            "selected-b".to_string(),
-            "selected-a".to_string(),
-            "selected-b".to_string(),
+            ("selected-a".to_string(), SessionSource::Exec),
+            ("selected-b".to_string(), second_session_source.clone()),
+            ("selected-a".to_string(), SessionSource::Exec),
+            ("selected-b".to_string(), second_session_source),
         ]
     );
     let selected_servers = |config: &codex_mcp::McpConfig| {
@@ -863,7 +1025,7 @@ async fn resume_and_fork_do_not_restore_thread_environments_from_rollout() {
             rollout_path.clone(),
             auth_manager,
             /*parent_trace*/ None,
-            /*supports_openai_form_elicitation*/ false,
+            ClientMcpExtensions::default(),
         )
         .await
         .expect("resume source thread");
@@ -1020,7 +1182,7 @@ async fn resume_active_thread_from_rollout_returns_running_thread() {
             rollout_path,
             auth_manager,
             /*parent_trace*/ None,
-            /*supports_openai_form_elicitation*/ false,
+            ClientMcpExtensions::default(),
         )
         .await
         .expect("resume active source thread");
@@ -1087,7 +1249,7 @@ async fn resume_stopped_thread_from_rollout_spawns_new_thread() {
             rollout_path,
             auth_manager,
             /*parent_trace*/ None,
-            /*supports_openai_form_elicitation*/ false,
+            ClientMcpExtensions::default(),
         )
         .await
         .expect("resume stopped source thread");
@@ -1161,7 +1323,7 @@ async fn resume_stopped_thread_from_rollout_preserves_thread_source() {
             rollout_path,
             auth_manager,
             /*parent_trace*/ None,
-            /*supports_openai_form_elicitation*/ false,
+            ClientMcpExtensions::default(),
         )
         .await
         .expect("resume source thread");
@@ -1287,7 +1449,7 @@ async fn rollout_path_resume_and_fork_read_history_through_thread_store() {
             }),
             auth_manager.clone(),
             /*parent_trace*/ None,
-            /*supports_openai_form_elicitation*/ false,
+            ClientMcpExtensions::default(),
         )
         .await
         .expect("seed rollout path in store");
@@ -1304,7 +1466,7 @@ async fn rollout_path_resume_and_fork_read_history_through_thread_store() {
             rollout_path.clone(),
             auth_manager,
             /*parent_trace*/ None,
-            /*supports_openai_form_elicitation*/ false,
+            ClientMcpExtensions::default(),
         )
         .await
         .expect("resume from rollout path");
@@ -1675,7 +1837,7 @@ async fn interrupted_fork_snapshot_does_not_synthesize_turn_id_for_legacy_histor
             ]),
             auth_manager,
             /*parent_trace*/ None,
-            /*supports_openai_form_elicitation*/ false,
+            ClientMcpExtensions::default(),
         )
         .await
         .expect("create source thread from completed history");
@@ -1795,7 +1957,7 @@ async fn interrupted_fork_snapshot_preserves_explicit_turn_id() {
             ]),
             auth_manager,
             /*parent_trace*/ None,
-            /*supports_openai_form_elicitation*/ false,
+            ClientMcpExtensions::default(),
         )
         .await
         .expect("create source thread from explicit partial history");
@@ -1891,7 +2053,7 @@ async fn interrupted_fork_snapshot_uses_persisted_mid_turn_history_without_live_
             ]),
             auth_manager,
             /*parent_trace*/ None,
-            /*supports_openai_form_elicitation*/ false,
+            ClientMcpExtensions::default(),
         )
         .await
         .expect("create source thread from partial history");

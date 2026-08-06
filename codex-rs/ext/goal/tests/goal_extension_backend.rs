@@ -12,6 +12,7 @@ use codex_analytics::AnalyticsEventsClient;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::ExtensionEventSink;
 use codex_extension_api::ExtensionRegistryBuilder;
+use codex_extension_api::ExtensionWarning;
 use codex_extension_api::FunctionCallError;
 use codex_extension_api::NoopTurnItemEmitter;
 use codex_extension_api::ThreadResumeInput;
@@ -1136,6 +1137,7 @@ async fn installed_tools_with_start(
                 persistent_thread_state_available,
                 environments: &[],
                 mcp_resource_client: None,
+                extension_metrics: None,
                 session_store: &session_store,
                 thread_store: &thread_store,
             })
@@ -1190,6 +1192,7 @@ impl GoalExtensionHarness {
                     persistent_thread_state_available: true,
                     environments: &[],
                     mcp_resource_client: None,
+                    extension_metrics: None,
                     session_store: &session_store,
                     thread_store: &thread_store,
                 })
@@ -1420,6 +1423,10 @@ impl ExtensionEventSink for RecordingEventSink {
     fn emit(&self, event: Event) {
         self.events().push(event);
     }
+
+    fn emit_warning(&self, _warning: ExtensionWarning) {
+        panic!("goal extension tests do not emit warnings");
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1455,6 +1462,7 @@ fn token_usage(
         output_tokens,
         reasoning_output_tokens,
         total_tokens,
+        codex_rollout_budget_units: None,
     }
 }
 

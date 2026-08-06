@@ -35,6 +35,15 @@ pub fn features_schema(schema_gen: &mut SchemaGenerator) -> Schema {
             );
             continue;
         }
+        if feature.id == codex_features::Feature::CodeModeHost {
+            validation.properties.insert(
+                feature.key.to_string(),
+                schema_gen.subschema_for::<codex_features::FeatureToml<
+                    codex_features::CodeModeHostConfigToml,
+                >>(),
+            );
+            continue;
+        }
         if feature.id == codex_features::Feature::NonPrefixedMcpToolNames {
             validation.properties.insert(
                 feature.key.to_string(),
@@ -105,6 +114,10 @@ pub fn features_schema(schema_gen: &mut SchemaGenerator) -> Schema {
             .properties
             .insert(legacy_key.to_string(), schema_gen.subschema_for::<bool>());
     }
+    validation.properties.insert(
+        "tool_registry".to_string(),
+        schema_gen.subschema_for::<codex_features::ToolRegistryConfigToml>(),
+    );
     validation.additional_properties = Some(Box::new(Schema::Bool(false)));
     object.object = Some(Box::new(validation));
 

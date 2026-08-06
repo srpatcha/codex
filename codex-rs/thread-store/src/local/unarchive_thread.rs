@@ -15,6 +15,7 @@ pub(super) async fn unarchive_thread(
     params: ArchiveThreadParams,
 ) -> ThreadStoreResult<StoredThread> {
     let thread_id = params.thread_id;
+    let _lifecycle_guard = store.live_writer_locks.lock_lifecycle(thread_id).await;
     let state_db_ctx = store.state_db().await;
     let archived_path = find_archived_thread_path_by_id_str(
         store.config.codex_home.as_path(),
@@ -164,7 +165,10 @@ mod tests {
         builder.cli_version = Some("test_version".to_string());
         let mut metadata = builder.build(config.default_model_provider_id.as_str());
         metadata.archived_at = Some(metadata.updated_at);
-        metadata.is_pinned = true;
+        metadata.section = Some(codex_state::ThreadSection {
+            id: codex_state::PINNED_THREAD_SECTION_ID.to_string(),
+            name: codex_state::PINNED_THREAD_SECTION_NAME.to_string(),
+        });
         runtime
             .upsert_thread(&metadata)
             .await
@@ -174,7 +178,7 @@ mod tests {
             .unarchive_thread(ArchiveThreadParams { thread_id })
             .await
             .expect("unarchive thread");
-        assert!(unarchived.is_pinned);
+        assert_eq!(unarchived.section, metadata.section);
 
         let restored_path = home
             .path()
@@ -188,6 +192,6 @@ mod tests {
         assert_eq!(updated.rollout_path, restored_path);
         assert_eq!(updated.archived_at, None);
         assert_eq!(updated.recency_at, metadata.recency_at);
-        assert!(updated.is_pinned);
+        assert_eq!(updated.section, metadata.section);
     }
 }

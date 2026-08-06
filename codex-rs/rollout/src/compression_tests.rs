@@ -309,6 +309,28 @@ async fn worker_compresses_old_active_and_archived_rollouts() -> anyhow::Result<
 }
 
 #[tokio::test]
+async fn worker_waits_for_rollout_maintenance_before_compressing() -> anyhow::Result<()> {
+    let home = TempDir::new()?;
+    let uuid = Uuid::from_u128(26);
+    let thread_id = ThreadId::from_string(&uuid.to_string())?;
+    let path = rollout_path(home.path(), "2025-01-03T12-00-00", uuid);
+    write_rollout(&path, thread_id, "migration in progress")?;
+    set_old_mtime(&path)?;
+    let guard = crate::try_acquire_rollout_maintenance_lock(home.path())?
+        .expect("claim rollout maintenance lock");
+
+    worker::run(home.path().to_path_buf()).await?;
+    assert!(path.exists());
+    assert!(!compressed_rollout_path(&path).exists());
+
+    drop(guard);
+    worker::run(home.path().to_path_buf()).await?;
+    assert!(!path.exists());
+    assert!(compressed_rollout_path(&path).exists());
+    Ok(())
+}
+
+#[tokio::test]
 async fn worker_skips_archived_paginated_fork_pointer_chain() -> anyhow::Result<()> {
     let home = TempDir::new()?;
     let source_uuid = Uuid::from_u128(16);
@@ -404,6 +426,8 @@ async fn resume_materializes_compressed_rollout_path() -> anyhow::Result<()> {
     write_rollout(&rollout_path, thread_id, "hello before resume")?;
     compress_now(&rollout_path)?;
     let compressed_path = compressed_rollout_path(&rollout_path);
+    set_old_mtime(compressed_path.as_path())?;
+    let compressed_modified = fs::metadata(compressed_path.as_path())?.modified()?;
 
     let InitialHistory::Resumed(history) =
         RolloutRecorder::get_rollout_history(compressed_path.as_path()).await?
@@ -421,6 +445,7 @@ async fn resume_materializes_compressed_rollout_path() -> anyhow::Result<()> {
     assert_eq!(recorder.rollout_path(), rollout_path.as_path());
     assert!(rollout_path.exists());
     assert!(!compressed_path.exists());
+    assert!(fs::metadata(rollout_path.as_path())?.modified()? > compressed_modified);
     recorder
         .record_canonical_items(&[RolloutItem::EventMsg(EventMsg::UserMessage(
             UserMessageEvent {
