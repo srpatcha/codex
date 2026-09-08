@@ -257,6 +257,9 @@ mod thread_session_state;
 mod thread_settings;
 mod thread_title;
 mod transcript_export;
+mod user_verification;
+mod user_verification_errors;
+mod user_verification_requests;
 mod working_directory;
 
 use self::agent_navigation::AgentNavigationDirection;
@@ -278,6 +281,10 @@ enum ThreadInteractiveRequest {
     AppLink(AppLinkViewParams),
     Approval(ApprovalRequest),
     McpServerElicitation(McpServerElicitationFormRequest),
+    UserVerification {
+        thread_id: ThreadId,
+        request: crate::bottom_pane::user_verification::UserVerificationRequest,
+    },
 }
 
 /// Extracts `receiver_thread_ids` from collab agent tool-call notifications.
