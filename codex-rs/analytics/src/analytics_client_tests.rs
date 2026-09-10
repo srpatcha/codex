@@ -1497,7 +1497,7 @@ fn compaction_event_serializes_expected_shape() {
                 turn_id: "turn-1".to_string(),
                 trigger: CompactionTrigger::Auto,
                 reason: CompactionReason::ContextLimit,
-                implementation: CompactionImplementation::ResponsesCompact,
+                implementation: CompactionImplementation::ResponsesCompactionV2,
                 phase: CompactionPhase::MidTurn,
                 strategy: CompactionStrategy::Memento,
                 status: CompactionStatus::Completed,
@@ -1550,7 +1550,7 @@ fn compaction_event_serializes_expected_shape() {
                 "parent_thread_id": null,
                 "trigger": "auto",
                 "reason": "context_limit",
-                "implementation": "responses_compact",
+                "implementation": "responses_compaction_v2",
                 "phase": "mid_turn",
                 "strategy": "memento",
                 "status": "completed",
@@ -5336,6 +5336,7 @@ async fn image_generation_events_preserve_transparent_background_metadata() {
             failure: None,
             saved_path: None,
             imagegen_request_id: None,
+            generation_id: None,
         });
 
         reducer
@@ -5481,6 +5482,7 @@ async fn turn_event_counts_completed_tool_items() {
             failure: None,
             saved_path: None,
             imagegen_request_id: Some("req-imagegen-123".to_string()),
+            generation_id: Some("gen-image-123".to_string()),
         }),
     ];
 
@@ -5579,6 +5581,10 @@ async fn turn_event_counts_completed_tool_items() {
     assert_eq!(
         payload["event_params"]["imagegen_request_id"],
         json!("req-imagegen-123")
+    );
+    assert_eq!(
+        payload["event_params"]["generation_id"],
+        json!("gen-image-123")
     );
 
     let mcp_tool_call_event = out

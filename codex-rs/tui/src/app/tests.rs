@@ -2369,7 +2369,7 @@ fn open_agent_picker_marks_loaded_threads_open() -> Result<()> {
 #[test]
 fn selected_and_resumed_threads_use_server_capability_for_v1_and_v2_children() -> Result<()> {
     const WORKER_THREADS: usize = 1;
-    const TEST_STACK_SIZE_BYTES: usize = 8 * 1024 * 1024;
+    const TEST_STACK_SIZE_BYTES: usize = 12 * 1024 * 1024;
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(WORKER_THREADS)
@@ -2377,8 +2377,9 @@ fn selected_and_resumed_threads_use_server_capability_for_v1_and_v2_children() -
         .enable_all()
         .build()?;
 
-    runtime.block_on(async {
-        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    // Keep the scenario and its large setup/resume futures off the test thread's stack.
+    runtime.block_on(Box::pin(async {
+        let (mut app, mut app_event_rx, _op_rx) = Box::pin(make_test_app_with_channels()).await;
         let root_thread_id = ThreadId::new();
         let rollout_dir = app
             .config
@@ -2450,16 +2451,17 @@ fn selected_and_resumed_threads_use_server_capability_for_v1_and_v2_children() -
         }
 
         // Cold-resume the persisted V2 root so its children are registered before selection.
-        let mut app_server =
-            crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref()).await?;
-        let root = app_server
-            .resume_thread(
-                &app.local_settings,
-                app.config.clone(),
-                root_thread_id,
-                crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
-            )
-            .await?;
+        let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(
+            app.chat_widget.config_ref(),
+        ))
+        .await?;
+        let root = Box::pin(app_server.resume_thread(
+            &app.local_settings,
+            app.config.clone(),
+            root_thread_id,
+            crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
+        ))
+        .await?;
         app.enqueue_primary_thread_session(root.session, root.turns)
             .await?;
         for (child_thread_id, multi_agent_version) in child_thread_ids
@@ -2531,14 +2533,13 @@ fn selected_and_resumed_threads_use_server_capability_for_v1_and_v2_children() -
                 .any(|event| matches!(event, AppEvent::CodexOp(Op::UserTurn { .. })))
         );
 
-        let resumed = app_server
-            .resume_thread(
-                &app.local_settings,
-                app.config.clone(),
-                child_thread_ids[1],
-                app.resume_model_settings(),
-            )
-            .await?;
+        let resumed = Box::pin(app_server.resume_thread(
+            &app.local_settings,
+            app.config.clone(),
+            child_thread_ids[1],
+            app.resume_model_settings(),
+        ))
+        .await?;
         assert!(resumed.blocks_direct_input);
         app.replace_chat_widget_with_app_server_thread(
             &mut tui,
@@ -2560,7 +2561,7 @@ fn selected_and_resumed_threads_use_server_capability_for_v1_and_v2_children() -
                 .any(|event| matches!(event, AppEvent::CodexOp(Op::UserTurn { .. })))
         );
         Ok(())
-    })
+    }))
 }
 
 #[test]
@@ -5859,6 +5860,7 @@ async fn make_test_app() -> App {
         has_emitted_history_lines: false,
         transcript_reflow: TranscriptReflowState::default(),
         initial_history_replay_buffer: None,
+        pending_thread_switch_resets: 0,
         scrollback_has_older_history: false,
         enhanced_keys_supported: false,
         keymap: crate::keymap::RuntimeKeymap::defaults(),
@@ -5957,6 +5959,7 @@ pub(super) async fn make_test_app_with_channels() -> (
             has_emitted_history_lines: false,
             transcript_reflow: TranscriptReflowState::default(),
             initial_history_replay_buffer: None,
+            pending_thread_switch_resets: 0,
             scrollback_has_older_history: false,
             enhanced_keys_supported: false,
             keymap: crate::keymap::RuntimeKeymap::defaults(),
@@ -6265,6 +6268,152 @@ fn test_thread_session(thread_id: ThreadId, cwd: PathBuf) -> ThreadSessionState 
 
 fn plain_line_cell(text: impl Into<String>) -> Arc<dyn HistoryCell> {
     Arc::new(PlainHistoryCell::new(vec![Line::from(text.into())])) as Arc<dyn HistoryCell>
+}
+
+#[tokio::test]
+async fn app_server_thread_replacement_clears_previous_transcript_before_replay() -> Result<()> {
+    let (mut app, mut events, _op_rx) = make_test_app_with_channels().await;
+    app.local_settings.tui.show_tooltips = false;
+    let previous_thread_id = ThreadId::new();
+    app.enqueue_primary_thread_session(
+        test_thread_session(previous_thread_id, test_path_buf("/tmp/previous")),
+        Vec::new(),
+    )
+    .await?;
+    while events.try_recv().is_ok() {}
+    app.transcript_cells = vec![plain_line_cell("Previous thread transcript")];
+    app.deferred_history_lines = vec![Line::from("Previous pending history").into()];
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    tui.insert_history_lines(vec![Line::from("Previous pending history")]);
+    app.chat_widget
+        .add_plain_history_lines(vec![Line::from("Previous queued history")]);
+    app.open_transcript_overlay(&mut tui);
+    assert!(tui.is_alt_screen_active());
+
+    let next_thread_id = ThreadId::new();
+    app.replace_chat_widget_with_app_server_thread(
+        &mut tui,
+        AppServerStartedThread {
+            session: test_thread_session(next_thread_id, test_path_buf("/tmp/next")),
+            turns: vec![test_turn(
+                "next-turn",
+                TurnStatus::Completed,
+                vec![ThreadItem::UserMessage {
+                    id: "next-user".to_string(),
+                    client_id: None,
+                    content: vec![AppServerUserInput::Text {
+                        text: "Next thread prompt".to_string(),
+                        text_elements: Vec::new(),
+                    }],
+                }],
+            )],
+            blocks_direct_input: false,
+            task_tools_available: false,
+        },
+        session_lifecycle::ThreadAttachPresentation::SessionLineage,
+        /*initial_user_message*/ None,
+    )
+    .await?;
+
+    assert_eq!(app.chat_widget.thread_id(), Some(next_thread_id));
+    assert!(!tui.is_alt_screen_active());
+    assert!(app.transcript_cells.is_empty());
+    assert!(app.deferred_history_lines.is_empty());
+    let mut app_server = crate::start_embedded_app_server_for_picker(&app.config).await?;
+    // The reset must still run if the transport disconnects before queued events are handled.
+    app.reconnect.offline = true;
+    while let Ok(event) = events.try_recv() {
+        app.handle_event(&mut tui, &mut app_server, event).await?;
+    }
+    let replayed_prompts = app
+        .transcript_cells
+        .iter()
+        .filter_map(|cell| {
+            cell.as_any()
+                .downcast_ref::<UserHistoryCell>()
+                .map(|user| user.message.as_str())
+        })
+        .collect::<Vec<_>>();
+    assert_snapshot!(replayed_prompts.join("\n"), @"Next thread prompt");
+    assert!(app.transcript_cells.iter().all(|cell| {
+        !lines_to_single_string(&cell.display_lines(/*width*/ 80))
+            .contains("Previous queued history")
+    }));
+    let rendered = app
+        .render_transcript_lines_for_reflow(/*width*/ 80)
+        .lines
+        .iter()
+        .map(|line| {
+            let text = rendered_line_text(line);
+            if text.contains("│ directory: ") {
+                "│ directory: <thread cwd>                │".to_string()
+            } else {
+                text
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!rendered.contains("Previous thread transcript"));
+    assert!(!rendered.contains("Previous queued history"));
+    assert_snapshot!(rendered);
+    app_server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn snapshot_thread_switch_discards_queued_previous_history() -> Result<()> {
+    let (mut app, mut events, _op_rx) = make_test_app_with_channels().await;
+    app.transcript_cells = vec![plain_line_cell("Previous thread transcript")];
+    app.chat_widget
+        .add_plain_history_lines(vec![Line::from("Previous queued history")]);
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    let mut app_server = crate::start_embedded_app_server_for_picker(&app.config).await?;
+    let next_thread_id = ThreadId::new();
+    app.render_thread_snapshot(
+        &mut tui,
+        &app_server,
+        next_thread_id,
+        ThreadEventSnapshot {
+            delegated_turns: Vec::new(),
+            session: Some(test_thread_session(
+                next_thread_id,
+                test_path_buf("/tmp/next"),
+            )),
+            turns: vec![test_turn(
+                "next-turn",
+                TurnStatus::Completed,
+                vec![ThreadItem::UserMessage {
+                    id: "next-user".to_string(),
+                    client_id: None,
+                    content: vec![AppServerUserInput::Text {
+                        text: "Next thread prompt".to_string(),
+                        text_elements: Vec::new(),
+                    }],
+                }],
+            )],
+            events: Vec::new(),
+            active_reasoning_item: None,
+            input_state: None,
+        },
+        /*resume_restored_queue*/ false,
+    )?;
+    assert_eq!(app.pending_thread_switch_resets, 1);
+    while let Ok(event) = events.try_recv() {
+        app.handle_event(&mut tui, &mut app_server, event).await?;
+    }
+    assert_eq!(app.pending_thread_switch_resets, 0);
+    let rendered = app
+        .render_transcript_lines_for_reflow(/*width*/ 80)
+        .lines
+        .iter()
+        .map(rendered_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!rendered.contains("Previous thread transcript"));
+    assert!(!rendered.contains("Previous queued history"));
+    assert!(rendered.contains("Next thread prompt"));
+    app_server.shutdown().await?;
+    Ok(())
 }
 
 fn rendered_line_text(line: &crate::terminal_hyperlinks::HyperlinkLine) -> String {
@@ -8647,8 +8796,8 @@ async fn selecting_cyber_model_defaults_active_thread_to_auto_review() {
             .try_list_models()
             .expect("model catalog")
             .into_iter()
-            .find(|model| model.model == "gpt-5.4")
-            .expect("gpt-5.4 model");
+            .find(|model| model.model == "gpt-5.5")
+            .expect("gpt-5.5 model");
         model.model_specialty = Some(MODEL_SPECIALTY_CYBER.to_string());
         app.model_catalog = Arc::new(ModelCatalog::new(vec![model]));
 
@@ -8685,7 +8834,7 @@ async fn selecting_cyber_model_defaults_active_thread_to_auto_review() {
             &mut tui,
             &mut app_server,
             AppEvent::ApplyAdvancedReasoning {
-                model: "gpt-5.4".to_string(),
+                model: "gpt-5.5".to_string(),
                 effort: ReasoningEffortConfig::High,
             },
         )
@@ -8696,7 +8845,7 @@ async fn selecting_cyber_model_defaults_active_thread_to_auto_review() {
         app.handle_event(
             &mut tui,
             &mut app_server,
-            AppEvent::UpdateModel("gpt-5.4".to_string()),
+            AppEvent::UpdateModel("gpt-5.5".to_string()),
         )
         .await
         .expect("model selection should succeed");
@@ -8844,8 +8993,8 @@ async fn selecting_cyber_model_falls_back_to_user_when_auto_review_is_unavailabl
         .try_list_models()
         .expect("model catalog")
         .into_iter()
-        .find(|model| model.model == "gpt-5.4")
-        .expect("gpt-5.4 model");
+        .find(|model| model.model == "gpt-5.5")
+        .expect("gpt-5.5 model");
     model.model_specialty = Some(MODEL_SPECIALTY_CYBER.to_string());
     app.model_catalog = Arc::new(ModelCatalog::new(vec![model]));
     let _ = app.config.features.disable(Feature::GuardianApproval);
@@ -8854,7 +9003,7 @@ async fn selecting_cyber_model_falls_back_to_user_when_auto_review_is_unavailabl
     app.active_thread_id = Some(ThreadId::new());
 
     let params = app
-        .active_thread_model_setting_update_params("gpt-5.4".to_string())
+        .active_thread_model_setting_update_params("gpt-5.5".to_string())
         .expect("active thread should produce update params");
 
     assert_eq!(
@@ -8899,8 +9048,8 @@ async fn selecting_cyber_model_respects_auto_review_requirements() {
             .try_list_models()
             .expect("model catalog")
             .into_iter()
-            .find(|model| model.model == "gpt-5.4")
-            .expect("gpt-5.4 model");
+            .find(|model| model.model == "gpt-5.5")
+            .expect("gpt-5.5 model");
         model.model_specialty = Some(MODEL_SPECIALTY_CYBER.to_string());
         app.model_catalog = Arc::new(ModelCatalog::new(vec![model]));
 
@@ -8925,7 +9074,7 @@ async fn selecting_cyber_model_respects_auto_review_requirements() {
         app.handle_event(
             &mut tui,
             &mut app_server,
-            AppEvent::UpdateModel("gpt-5.4".to_string()),
+            AppEvent::UpdateModel("gpt-5.5".to_string()),
         )
         .await
         .expect("model selection should succeed");

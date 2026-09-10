@@ -278,7 +278,7 @@ pub(crate) enum AppEvent {
     },
     /// Start a background task directly from the shared dashboard.
     DispatchAgentsOverviewTask {
-        prompt: String,
+        prompt: UserMessage,
         cwd: Option<AbsolutePathBuf>,
     },
     /// Rename a task directly from the shared dashboard.
@@ -507,6 +507,9 @@ pub(crate) enum AppEvent {
     ClearUi {
         name: Option<String>,
     },
+
+    /// Clear history queued by the previous thread before the new thread's replay events.
+    ResetTranscriptForThreadSwitch,
 
     /// Re-render the transcript using the selected scrollback rendering mode.
     RawOutputModeChanged {
@@ -1226,19 +1229,6 @@ pub(crate) enum AppEvent {
     BeginWindowsSandboxLegacySetup {
         preset: ApprovalPreset,
         profile_selection: Option<PermissionProfileSelection>,
-    },
-
-    /// Begin a non-elevated grant of read access for an additional directory.
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-    BeginWindowsSandboxGrantReadRoot {
-        path: String,
-    },
-
-    /// Result of attempting to grant read access for an additional directory.
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-    WindowsSandboxGrantReadRootCompleted {
-        path: PathBuf,
-        error: Option<String>,
     },
 
     /// Enable the Windows sandbox feature and switch to Agent mode.

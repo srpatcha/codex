@@ -22,6 +22,18 @@ late proofs after the approval is canceled or resolved. Only one native worker
 runs per app-server; if an OS call remains active after cancellation or timeout,
 subsequent local operations return `failed/providerError` until that worker exits.
 
+# Hosted Codex Apps MCP protocol
+
+The host-owned HTTP `codex_apps` server uses Legacy by default in app-server and
+standalone Codex. To discover the 2026-07-28 protocol, set
+`codex_apps_mcp_2026_07_28 = true` under `[features]`, or send a true runtime
+override via `experimentalFeature/enablement/set`. Discovery falls back to Legacy
+when the server does not support it. Explicit config takes precedence.
+The dedicated setting does not apply to third-party HTTP or local `codex_app`
+stdio servers. The existing `mcp_2026_07_28` flag still governs eligible other
+servers, regardless of whether their names or URLs resemble hosted Apps.
+App-server does not persist this selection.
+
 # Thread removal
 
 `thread/archive` and `thread/delete` reject attempts to remove a live internal
@@ -31,3 +43,10 @@ after a client tries to archive or delete it.
 
 After the owner releases the worker, its saved conversation can be archived or
 deleted normally. Ordinary client-controlled threads keep their existing behavior.
+
+# Amazon Bedrock authentication
+
+If `model_providers.amazon-bedrock.aws.credential_export` is configured, Bedrock setup and
+Bedrock login return an error without changing configuration or saved credentials. Remove the
+exporter configuration before selecting another credential source. `aws.credential_export` and
+`aws.profile` cannot be configured together.
