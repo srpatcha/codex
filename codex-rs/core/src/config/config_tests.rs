@@ -1217,9 +1217,9 @@ command = "print-token"
     assert_eq!(config.model_provider, expected_provider);
 }
 
-#[tokio::test]
-async fn load_config_rejects_unsupported_amazon_bedrock_overrides() {
-    let cfg = toml::from_str::<ConfigToml>(
+#[test]
+fn config_toml_rejects_unsupported_amazon_bedrock_overrides() {
+    let err = toml::from_str::<ConfigToml>(
         r#"
 model_provider = "amazon-bedrock"
 
@@ -1229,17 +1229,7 @@ requires_openai_auth = true
 supports_websockets = true
 "#,
     )
-    .expect("Amazon Bedrock unsupported overrides should deserialize");
-
-    let err = Config::load_from_base_config_with_overrides(
-        cfg,
-        ConfigOverrides::default(),
-        tempdir().expect("tempdir").abs(),
-    )
-    .await
-    .unwrap_err();
-
-    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    .expect_err("Amazon Bedrock unsupported overrides should fail validation");
     assert!(err.to_string().contains(
         "model_providers.amazon-bedrock only supports changing `base_url`, `auth`, `http_headers`, `aws.profile`, `aws.region`, `aws.credential_export`, and `aws.auth_refresh`; other non-default provider fields are not supported"
     ));
@@ -6163,6 +6153,50 @@ async fn config_applies_managed_auth_store_and_chatgpt_base_url() -> std::io::Re
 }
 
 #[tokio::test]
+async fn project_cannot_be_the_only_xaa_opt_in_source() -> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+    let config_layer_stack = ConfigLayerStack::new(
+        vec![ConfigLayerEntry::new(
+            ConfigLayerSource::Project {
+                dot_codex_folder: codex_home.path().join("project/.codex").abs(),
+            },
+            toml::toml! {
+                [features]
+                use_xaa = true
+            }
+            .into(),
+        )],
+        Default::default(),
+        Default::default(),
+    )?;
+    let cfg = config_layer_stack
+        .effective_config()
+        .try_into()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+
+    let error = Config::load_config_with_layer_stack(
+        LOCAL_FS.as_ref(),
+        cfg,
+        ConfigOverrides {
+            cwd: Some(codex_home.path().to_path_buf()),
+            ..Default::default()
+        },
+        codex_home.abs(),
+        config_layer_stack,
+    )
+    .await
+    .expect_err("project-only XAA opt-in must fail");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(
+        error
+            .to_string()
+            .contains("must be selected in a non-project config layer")
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn config_resolves_default_oauth_store_mode() -> std::io::Result<()> {
     let codex_home = TempDir::new()?;
     let cfg = ConfigToml::default();
@@ -7962,6 +7996,7 @@ async fn replace_mcp_servers_streamable_http_serializes_oauth_resource() -> anyh
                 client_id: Some("eci-prd-pub-codex-123".to_string()),
                 callback_url: None,
                 callback_port: None,
+                ..Default::default()
             }),
             oauth_resource: Some("https://resource.example.com".to_string()),
             tools: HashMap::new(),
@@ -8197,29 +8232,38 @@ async fn load_config_uses_requirements_guardian_policy_config() -> std::io::Resu
 }
 
 #[test]
-fn config_toml_deserializes_auto_review_policy() {
+fn config_toml_deserializes_auto_review_policy_and_template() {
     let cfg = toml::from_str::<ConfigToml>(
         r#"
 [auto_review]
 policy = "Use the user-configured guardian policy."
+experimental_policy_template = "Configured template: {{ tenant_policy_config }}"
 "#,
     )
     .expect("TOML deserialization should succeed");
 
+    let auto_review = cfg.auto_review.as_ref().expect("auto-review config");
     assert_eq!(
-        cfg.auto_review
-            .as_ref()
-            .and_then(|auto_review| auto_review.policy.as_deref()),
-        Some("Use the user-configured guardian policy.")
+        (
+            auto_review.policy.as_deref(),
+            auto_review.experimental_policy_template.as_deref(),
+        ),
+        (
+            Some("Use the user-configured guardian policy."),
+            Some("Configured template: {{ tenant_policy_config }}"),
+        )
     );
 }
 
 #[tokio::test]
-async fn load_config_uses_auto_review_guardian_policy_config() -> std::io::Result<()> {
+async fn load_config_uses_auto_review_guardian_policy_config_and_template() -> std::io::Result<()> {
     let codex_home = TempDir::new()?;
     let cfg = ConfigToml {
         auto_review: Some(AutoReviewToml {
             policy: Some("  Use the user-configured guardian policy.  ".to_string()),
+            experimental_policy_template: Some(
+                "  Configured template: {{ tenant_policy_config }}  ".to_string(),
+            ),
         }),
         ..Default::default()
     };
@@ -8235,8 +8279,14 @@ async fn load_config_uses_auto_review_guardian_policy_config() -> std::io::Resul
     .await?;
 
     assert_eq!(
-        config.guardian_policy_config.as_deref(),
-        Some("Use the user-configured guardian policy.")
+        (
+            config.guardian_policy_config.as_deref(),
+            config.guardian_policy_template.as_deref(),
+        ),
+        (
+            Some("Use the user-configured guardian policy."),
+            Some("Configured template: {{ tenant_policy_config }}"),
+        )
     );
 
     Ok(())
@@ -8257,6 +8307,7 @@ async fn requirements_guardian_policy_beats_auto_review() -> std::io::Result<()>
     let cfg = ConfigToml {
         auto_review: Some(AutoReviewToml {
             policy: Some("Use the user-configured guardian policy.".to_string()),
+            experimental_policy_template: None,
         }),
         ..Default::default()
     };
@@ -8287,6 +8338,7 @@ async fn load_config_ignores_empty_auto_review_guardian_policy_config() -> std::
     let cfg = ConfigToml {
         auto_review: Some(AutoReviewToml {
             policy: Some("   ".to_string()),
+            experimental_policy_template: None,
         }),
         ..Default::default()
     };
@@ -9997,6 +10049,8 @@ async fn test_requirements_web_search_mode_allowlist_does_not_warn_when_unset() 
     let fixture = create_test_fixture()?;
 
     let requirements_toml = codex_config::ConfigRequirementsToml {
+        model_provider: None,
+        model_providers: None,
         allowed_login_methods: None,
         allowed_chatgpt_workspaces: None,
         cli_auth_credentials_store: None,
@@ -10880,6 +10934,10 @@ default_permissions = "dev"
 async fn permission_profile_override_falls_back_when_disallowed_by_requirements()
 -> std::io::Result<()> {
     let codex_home = TempDir::new()?;
+    std::fs::write(
+        codex_home.path().join(CONFIG_TOML_FILE),
+        "[features.network_proxy]\nenabled = true\nproxy_url = 'http://127.0.0.1:43128'\n",
+    )?;
     let config = ConfigBuilder::without_managed_config_for_tests()
         .codex_home(codex_home.path().to_path_buf())
         .fallback_cwd(Some(codex_home.path().to_path_buf()))
@@ -10901,6 +10959,17 @@ async fn permission_profile_override_falls_back_when_disallowed_by_requirements(
         config.permissions.effective_permission_profile(),
         PermissionProfile::read_only()
     );
+    // Prepare the proxy while the candidate permits network, before fallback.
+    let expected_network = NetworkProxySpec::from_config_and_constraints(
+        NetworkProxyConfig {
+            enabled: true,
+            proxy_url: "http://127.0.0.1:43128".to_string(),
+            ..Default::default()
+        },
+        /*requirements*/ None,
+        &PermissionProfile::read_only(),
+    )?;
+    assert_eq!(config.permissions.network, Some(expected_network));
     Ok(())
 }
 
@@ -11132,15 +11201,16 @@ async fn feature_requirements_normalize_effective_feature_values() -> std::io::R
             CloudConfigBundleFixture::loader_with_enterprise_requirement(
                 r#"
 [features]
-personality = true
+view_image = true
 shell_tool = false
+use_xaa = true
 "#,
             ),
         )
         .build()
         .await?;
 
-    assert!(config.features.enabled(Feature::Personality));
+    assert!(config.features.enabled(Feature::ViewImage));
     assert!(!config.features.enabled(Feature::ShellTool));
     assert!(
         !config
@@ -11157,6 +11227,10 @@ shell_tool = false
 #[tokio::test]
 async fn feature_requirements_can_still_disable_unified_exec() -> std::io::Result<()> {
     let codex_home = TempDir::new()?;
+    std::fs::write(
+        codex_home.path().join(CONFIG_TOML_FILE),
+        "[features]\nuse_xaa = true\n",
+    )?;
 
     let mut config = ConfigBuilder::without_managed_config_for_tests()
         .codex_home(codex_home.path().to_path_buf())
@@ -11167,6 +11241,7 @@ async fn feature_requirements_can_still_disable_unified_exec() -> std::io::Resul
 unified_exec = false
 shell_tool = true
 unified_exec_zsh_fork = false
+use_xaa = false
 "#,
             ),
         )
@@ -11321,7 +11396,7 @@ async fn explicit_feature_config_is_normalized_by_requirements() -> std::io::Res
         codex_home.path().join(CONFIG_TOML_FILE),
         r#"
 [features]
-personality = false
+view_image = false
 shell_tool = true
 "#,
     )?;
@@ -11333,7 +11408,7 @@ shell_tool = true
             CloudConfigBundleFixture::loader_with_enterprise_requirement(
                 r#"
 [features]
-personality = true
+view_image = true
 shell_tool = false
 "#,
             ),
@@ -11341,7 +11416,7 @@ shell_tool = false
         .build()
         .await?;
 
-    assert!(config.features.enabled(Feature::Personality));
+    assert!(config.features.enabled(Feature::ViewImage));
     assert!(!config.features.enabled(Feature::ShellTool));
     assert!(
         !config
@@ -11351,6 +11426,55 @@ shell_tool = false
         "{:?}",
         config.startup_warnings
     );
+
+    Ok(())
+}
+
+#[test]
+fn retired_personality_feature_requirements_do_not_reject_configured_values() -> std::io::Result<()>
+{
+    for (configured, required) in [(true, false), (false, true)] {
+        let cfg: ConfigToml = toml::from_str(&format!(
+            "[features]\npersonality = {configured}\nshell_tool = false\n"
+        ))
+        .expect("valid config");
+        let requirement = Sourced::new(
+            FeatureRequirementsToml {
+                entries: BTreeMap::from([
+                    ("personality".to_string(), required),
+                    ("shell_tool".to_string(), false),
+                ]),
+            },
+            RequirementSource::EnterpriseManaged {
+                id: "enterprise-id".to_string(),
+                name: "enterprise".to_string(),
+            },
+        );
+        validate_feature_requirements_for_config_toml(&cfg, Some(&requirement))?;
+
+        let configured_features = Features::from_sources(
+            FeatureConfigSource {
+                features: cfg.features.as_ref(),
+                ..Default::default()
+            },
+            FeatureConfigSource::default(),
+            FeatureOverrides::default(),
+        );
+        let mut warnings = Vec::new();
+        let features = ManagedFeatures::from_configured_with_warnings(
+            configured_features,
+            Some(requirement),
+            &mut warnings,
+        )?;
+        assert_eq!(
+            (
+                features.enabled(Feature::Personality),
+                features.enabled(Feature::ShellTool),
+                warnings,
+            ),
+            (false, false, Vec::new()),
+        );
+    }
 
     Ok(())
 }
@@ -12252,7 +12376,7 @@ async fn feature_requirements_normalize_runtime_feature_mutations() -> std::io::
             CloudConfigBundleFixture::loader_with_enterprise_requirement(
                 r#"
 [features]
-personality = true
+view_image = true
 shell_tool = false
 "#,
             ),
@@ -12262,7 +12386,7 @@ shell_tool = false
 
     let mut requested = config.features.get().clone();
     requested
-        .disable(Feature::Personality)
+        .disable(Feature::ViewImage)
         .enable(Feature::ShellTool);
     assert!(config.features.can_set(&requested).is_ok());
     config
@@ -12270,7 +12394,7 @@ shell_tool = false
         .set(requested)
         .expect("managed feature mutations should normalize successfully");
 
-    assert!(config.features.enabled(Feature::Personality));
+    assert!(config.features.enabled(Feature::ViewImage));
     assert!(!config.features.enabled(Feature::ShellTool));
 
     Ok(())

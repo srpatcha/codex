@@ -1,5 +1,6 @@
 use super::*;
 use crate::app_event::HistoryLookupResponse;
+use codex_app_server_protocol::ImageReference;
 use codex_app_server_protocol::NetworkAccess;
 use codex_app_server_protocol::SandboxPolicy;
 use codex_protocol::models::FunctionCallOutputBody;
@@ -523,7 +524,9 @@ async fn replayed_user_message_preserves_remote_image_urls() {
                 text_elements: Vec::new(),
             },
             AppServerUserInput::Image {
-                url: remote_image_urls[0].clone(),
+                image: ImageReference::Inline {
+                    url: remote_image_urls[0].clone(),
+                },
                 detail: None,
             },
         ],
@@ -783,7 +786,9 @@ async fn replayed_user_message_with_only_remote_images_renders_history_cell() {
         &mut chat,
         "user-1",
         vec![AppServerUserInput::Image {
-            url: remote_image_urls[0].clone(),
+            image: ImageReference::Inline {
+                url: remote_image_urls[0].clone(),
+            },
             detail: None,
         }],
         ReplayKind::ResumeInitialMessages,
@@ -1218,6 +1223,7 @@ async fn replayed_in_progress_mcp_tool_call_stays_active() {
             arguments: json!({"action": "wait"}),
             app_context: None,
             mcp_app_resource_uri: None,
+            mcp_app_ui: None,
             plugin_id: None,
             read_only_hint: None,
             result: None,
@@ -1253,6 +1259,7 @@ async fn failed_repl_mcp_tool_call_preserves_status_and_result() {
                     arguments: json!({"title": "Inspect workspace"}),
                     app_context: None,
                     mcp_app_resource_uri: None,
+                    mcp_app_ui: None,
                     plugin_id: None,
                     read_only_hint: None,
                     result: Some(Box::new(codex_app_server_protocol::McpToolCallResult {
@@ -1321,6 +1328,7 @@ async fn deferred_mcp_lifecycle_events_keep_fifo_after_stream_finishes() {
         arguments: json!({"action": "wait"}),
         app_context: None,
         mcp_app_resource_uri: None,
+        mcp_app_ui: None,
         plugin_id: None,
         read_only_hint: None,
         result: None,
@@ -1338,6 +1346,7 @@ async fn deferred_mcp_lifecycle_events_keep_fifo_after_stream_finishes() {
         arguments: json!({"action": "wait"}),
         app_context: None,
         mcp_app_resource_uri: None,
+        mcp_app_ui: None,
         plugin_id: None,
         read_only_hint: None,
         result: Some(Box::new(codex_app_server_protocol::McpToolCallResult {
@@ -1603,13 +1612,11 @@ async fn thread_snapshot_replayed_stream_recovery_restores_previous_status_heade
 
     replay_agent_message_delta(&mut chat, "hello", ReplayKind::ThreadSnapshot);
 
-    let status = chat
-        .bottom_pane
-        .status_widget()
-        .expect("status indicator should be visible");
-    assert_eq!(status.header(), "Working");
-    assert_eq!(status.details(), None);
+    assert_eq!(chat.status_state.current_status.header, "Working");
+    assert_eq!(chat.status_state.current_status.details, None);
     assert!(chat.status_state.retry_status_header.is_none());
+    assert!(chat.bottom_pane.status_widget().is_none());
+    assert!(chat.active_cell_is_stream_tail());
 }
 
 #[tokio::test]
@@ -1625,11 +1632,9 @@ async fn stream_recovery_restores_previous_status_header() {
     drain_insert_history(&mut rx);
     handle_agent_message_delta(&mut chat, "hello");
 
-    let status = chat
-        .bottom_pane
-        .status_widget()
-        .expect("status indicator should be visible");
-    assert_eq!(status.header(), "Working");
-    assert_eq!(status.details(), None);
+    assert_eq!(chat.status_state.current_status.header, "Working");
+    assert_eq!(chat.status_state.current_status.details, None);
     assert!(chat.status_state.retry_status_header.is_none());
+    assert!(chat.bottom_pane.status_widget().is_none());
+    assert!(chat.active_cell_is_stream_tail());
 }

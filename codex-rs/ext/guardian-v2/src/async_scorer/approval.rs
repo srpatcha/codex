@@ -4,15 +4,14 @@
 use super::authorization::ScoreAuthorization;
 use super::config::GuardianV2Config;
 use super::coverage::GuardianPolicy;
-use super::extension::GuardianV2ScoreProgress;
 use super::metrics::TOOL_CALL_LAG_METRIC;
 use super::metrics::record_fast_decision;
 use super::parent_compaction::select_parent_compaction;
 use super::sampler::LunaSampler;
+use super::score::GuardianV2ScoreProgress;
 use codex_core::CodexThread;
 use codex_core::ThreadManager;
 use codex_core::context::GuardianContextMode;
-use codex_core::context::GuardianReviewEvidence;
 use codex_extension_api::ApprovalDecision;
 use codex_extension_api::ApprovalDecisionInput;
 use codex_extension_api::ApprovalReviewContributor;
@@ -22,6 +21,7 @@ use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::openai_models::GuardianReviewMode;
 use codex_protocol::openai_models::GuardianScope;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::TruncationPolicy;
 use codex_protocol::security_risk::SecurityRiskScore;
 use std::sync::Weak;
 use std::sync::atomic::Ordering;
@@ -36,7 +36,7 @@ impl ApprovalReviewContributor for GuardianApprovalReviewer {
         input: &'a ApprovalDecisionInput<'_>,
     ) -> ExtensionFuture<'a, Option<ApprovalDecision>> {
         Box::pin(async move {
-            // If the extension is unavailable, core keeps its existing synchronous fallback.
+            // If the scorer is unavailable, the reviewer extension runs its synchronous fallback.
             let manager = self.thread_manager.upgrade()?;
             let Ok(thread) = manager.get_thread(input.thread_id).await else {
                 record_fast_decision(input.metrics.as_deref(), "deferred", "scoring_failure");
@@ -116,7 +116,10 @@ impl GuardianApprovalReviewer {
             ?reason,
             "reviewing approval"
         );
-        ApprovalDecision::Reviewed(input.synchronous_reviewer.review(reason).await)
+        match input.synchronous_reviewer.review(reason).await {
+            Some(decision) => ApprovalDecision::Reviewed(decision),
+            None => ApprovalDecision::AskUser,
+        }
     }
 }
 
@@ -132,14 +135,36 @@ async fn cached_evidence(
         record_fast_decision(metrics, "deferred", "missing_score");
         return Err(GuardianReviewReason::MissingScore);
     };
-    let context_mode = store
-        .get_or_init(GuardianReviewEvidence::default)
-        .context_mode();
+    // Elicitations and intercepted execs can expand beyond the original scored action.
+    let mut action = input.action.clone();
+    if action.get("tool").and_then(serde_json::Value::as_str) == Some("mcp_tool_call")
+        && let Some(fields) = action.as_object_mut()
+    {
+        // Match the action renderer: host descriptions are optional, arguments are not.
+        fields.remove("tool_description");
+        fields.remove("connector_description");
+    }
+    let max_action_bytes = TruncationPolicy::Tokens(config.max_action_tokens).byte_budget();
+    let action_fits = serde_json::to_string_pretty(&action)
+        .is_ok_and(|action| action.len().saturating_add(1) <= max_action_bytes);
+    if !action_fits
+        || input.tool_call_id.is_some_and(|call_id| {
+            progress
+                .oversized_tool_calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(call_id)
+        })
+    {
+        record_fast_decision(metrics, "deferred", "scoring_failure");
+        return Err(GuardianReviewReason::ScoringFailure);
+    }
+    let history = thread.conversation_history_snapshot().await;
+    let context_mode = GuardianContextMode::from_history(history.as_ref());
     if context_mode == GuardianContextMode::ThreadOwned {
         let sampler = store
             .get::<LunaSampler>()
             .ok_or(GuardianReviewReason::MissingScore)?;
-        let history = thread.conversation_history_snapshot().await;
         if select_parent_compaction(
             context_mode,
             config,
