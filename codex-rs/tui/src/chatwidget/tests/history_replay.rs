@@ -1,3 +1,4 @@
+use super::helpers::drain_insert_history_transcript;
 use super::*;
 use crate::app_event::HistoryLookupResponse;
 use codex_app_server_protocol::ImageReference;
@@ -19,6 +20,7 @@ async fn resumed_initial_messages_render_history() {
     let thread_id = ThreadId::new();
     let rollout_file = NamedTempFile::new().unwrap();
     let configured = crate::session_state::ThreadSessionState {
+        windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id,
         forked_from_id: None,
         fork_parent_title: None,
@@ -113,7 +115,7 @@ async fn replayed_failed_turns_preserve_overload_warnings_between_retries() {
         ReplayKind::ResumeInitialMessages,
     );
 
-    let rendered = drain_insert_history(&mut rx)
+    let rendered = drain_insert_history_transcript(&mut rx)
         .into_iter()
         .map(|lines| lines_to_single_string(&lines))
         .collect::<String>();
@@ -133,6 +135,7 @@ async fn restored_conversation_ultra_remains_selected_after_switching_to_plan() 
     chat.set_plan_mode_reasoning_effort(Some(ReasoningEffortConfig::High));
 
     chat.handle_thread_session(crate::session_state::ThreadSessionState {
+        windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id: ThreadId::new(),
         forked_from_id: None,
         fork_parent_title: None,
@@ -420,6 +423,7 @@ async fn replayed_user_message_preserves_text_elements_and_local_images() {
     let thread_id = ThreadId::new();
     let rollout_file = NamedTempFile::new().unwrap();
     let configured = crate::session_state::ThreadSessionState {
+        windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id,
         forked_from_id: None,
         fork_parent_title: None,
@@ -492,6 +496,7 @@ async fn replayed_user_message_preserves_remote_image_urls() {
     let thread_id = ThreadId::new();
     let rollout_file = NamedTempFile::new().unwrap();
     let configured = crate::session_state::ThreadSessionState {
+        windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id,
         forked_from_id: None,
         fork_parent_title: None,
@@ -598,6 +603,7 @@ async fn session_configured_syncs_widget_config_permissions_and_cwd() {
         .expect("permission profile should project to legacy sandbox policy");
     let expected_sandbox = SandboxPolicy::from(expected_core_sandbox);
     let configured = crate::session_state::ThreadSessionState {
+        windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id: ThreadId::new(),
         forked_from_id: None,
         fork_parent_title: None,
@@ -671,6 +677,7 @@ async fn session_configured_preserves_profile_workspace_roots() {
     let session_permission_profile = PermissionProfile::workspace_write()
         .materialize_project_roots_with_workspace_roots(&session_effective_workspace_roots);
     let configured = crate::session_state::ThreadSessionState {
+        windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id: ThreadId::new(),
         forked_from_id: None,
         fork_parent_title: None,
@@ -718,6 +725,7 @@ async fn session_configured_external_sandbox_keeps_external_runtime_policy() {
         network_access: NetworkAccess::Restricted,
     };
     let configured = crate::session_state::ThreadSessionState {
+        windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id: ThreadId::new(),
         forked_from_id: None,
         fork_parent_title: None,
@@ -759,6 +767,7 @@ async fn replayed_user_message_with_only_remote_images_renders_history_cell() {
     let thread_id = ThreadId::new();
     let rollout_file = NamedTempFile::new().unwrap();
     let configured = crate::session_state::ThreadSessionState {
+        windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id,
         forked_from_id: None,
         fork_parent_title: None,
@@ -819,6 +828,7 @@ async fn replayed_user_message_with_only_local_images_renders_history_cell() {
     let thread_id = ThreadId::new();
     let rollout_file = NamedTempFile::new().unwrap();
     let configured = crate::session_state::ThreadSessionState {
+        windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id,
         forked_from_id: None,
         fork_parent_title: None,
@@ -925,6 +935,63 @@ async fn forked_thread_history_line_without_name_shows_id_once_snapshot() {
     let combined = lines_to_single_string(&history_cell.display_lines(/*width*/ 80));
 
     assert_chatwidget_snapshot!("forked_thread_history_line_without_name", combined);
+}
+
+#[tokio::test]
+async fn prompt_edit_stops_streaming_without_submitting_queued_input() {
+    let (mut chat, _events, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.on_task_started();
+    chat.on_agent_message_delta("removed response".into());
+    chat.queue_user_message("queued follow-up".into());
+    chat.enter_review_mode_with_hint("review".into(), /*from_replay*/ false);
+
+    let retained_turn = AppServerTurn {
+        items: vec![
+            AppServerThreadItem::AgentMessage {
+                id: "retained-response".to_string(),
+                text: "retained response".to_string(),
+                phase: Some(MessagePhase::FinalAnswer),
+                memory_citation: None,
+                delivery: None,
+                questions: None,
+            },
+            AppServerThreadItem::UserMessage {
+                id: "voice-steer".to_string(),
+                client_id: None,
+                content: vec![UserInput::Text {
+                    text: "<realtime_delegation><input>voice input</input></realtime_delegation>"
+                        .to_string(),
+                    text_elements: Vec::new(),
+                }],
+            },
+            AppServerThreadItem::AgentMessage {
+                id: "private-commentary".to_string(),
+                text: "hidden voice commentary".to_string(),
+                phase: Some(MessagePhase::Commentary),
+                memory_citation: None,
+                delivery: None,
+                questions: None,
+            },
+        ],
+        ..app_server_turn(
+            "retained-turn",
+            AppServerTurnStatus::Completed,
+            /*duration_ms*/ None,
+            /*error*/ None,
+        )
+    };
+    chat.reset_after_prompt_revert(/*rollout_path*/ None, &[retained_turn]);
+    chat.pre_draw_tick();
+
+    assert_eq!(
+        (
+            chat.is_user_turn_pending_or_running(),
+            chat.has_active_stream_tail(),
+            chat.maybe_send_next_queued_input(),
+            chat.last_agent_markdown_text(),
+        ),
+        (false, false, false, Some("retained response")),
+    );
 }
 
 #[tokio::test]
@@ -1116,6 +1183,7 @@ async fn replayed_reasoning_item_preserves_summary_parts_and_hides_raw_reasoning
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.config.show_raw_agent_reasoning = false;
     chat.handle_thread_session(crate::session_state::ThreadSessionState {
+        windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id: ThreadId::new(),
         forked_from_id: None,
         fork_parent_title: None,
@@ -1167,6 +1235,7 @@ async fn replayed_reasoning_item_shows_raw_reasoning_when_enabled() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.config.show_raw_agent_reasoning = true;
     chat.handle_thread_session(crate::session_state::ThreadSessionState {
+        windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id: ThreadId::new(),
         forked_from_id: None,
         fork_parent_title: None,
@@ -1210,26 +1279,27 @@ async fn replayed_reasoning_item_shows_raw_reasoning_when_enabled() {
 }
 
 #[tokio::test]
-async fn replayed_in_progress_mcp_tool_call_stays_active() {
+async fn replayed_mcp_tool_call_stays_active_until_completion() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     let _ = drain_insert_history(&mut rx);
 
+    let mut item = AppServerThreadItem::McpToolCall {
+        id: "mcp-1".to_string(),
+        server: "copilot-bridge".to_string(),
+        tool: "copilot".to_string(),
+        status: codex_app_server_protocol::McpToolCallStatus::InProgress,
+        arguments: json!({"action": "wait"}),
+        app_context: None,
+        mcp_app_resource_uri: None,
+        mcp_app_ui: None,
+        plugin_id: None,
+        read_only_hint: None,
+        result: None,
+        error: None,
+        duration_ms: None,
+    };
     chat.replay_thread_item(
-        AppServerThreadItem::McpToolCall {
-            id: "mcp-1".to_string(),
-            server: "copilot-bridge".to_string(),
-            tool: "copilot".to_string(),
-            status: codex_app_server_protocol::McpToolCallStatus::InProgress,
-            arguments: json!({"action": "wait"}),
-            app_context: None,
-            mcp_app_resource_uri: None,
-            mcp_app_ui: None,
-            plugin_id: None,
-            read_only_hint: None,
-            result: None,
-            error: None,
-            duration_ms: None,
-        },
+        item.clone(),
         "turn-1".to_string(),
         ReplayKind::ThreadSnapshot,
     );
@@ -1238,6 +1308,17 @@ async fn replayed_in_progress_mcp_tool_call_stays_active() {
     let active = active_blob(&chat);
     assert!(active.contains("Calling"));
     assert!(!active.contains("MCP tool call completed without a result"));
+
+    if let AppServerThreadItem::McpToolCall { status, .. } = &mut item {
+        *status = codex_app_server_protocol::McpToolCallStatus::Completed;
+    }
+    chat.on_mcp_tool_call_completed(item);
+    assert!(chat.transcript.active_cell.is_none());
+    let completed = drain_insert_history(&mut rx);
+    assert_eq!(completed.len(), 1);
+    assert!(
+        lines_to_single_string(&completed[0]).contains("MCP tool call completed without a result")
+    );
 }
 
 #[tokio::test]
@@ -1289,11 +1370,11 @@ async fn failed_repl_mcp_tool_call_preserves_status_and_result() {
         }
         insta::allow_duplicates! {
             insta::assert_snapshot!(lines_to_single_string(lines), @r#"
-            • Called Inspect workspace
+            • Inspect workspace
               └ Script failed
                 {"exit_code": 0, "output": "ready", "chunk_id": "chunk-1"}
                 Script error:
-                permission denied
+                +1 line (ctrl+t to view transcript)
             "#);
         }
         assert_eq!(
@@ -1301,9 +1382,7 @@ async fn failed_repl_mcp_tool_call_preserves_status_and_result() {
             Some(&Line::from(vec![
                 "•".red().bold(),
                 " ".into(),
-                "Called".bold(),
-                " ".into(),
-                "Inspect workspace".cyan(),
+                "Inspect workspace".fg(crate::style::accent_color()),
             ])),
             "{server}",
         );

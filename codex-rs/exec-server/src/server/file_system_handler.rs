@@ -8,7 +8,7 @@ use crate::CapabilityRootsDiscoverParams;
 use crate::CapabilityRootsDiscoverResponse;
 use crate::CopyOptions;
 use crate::CreateDirectoryOptions;
-use crate::ExecServerRuntimePaths;
+use crate::ExecServerRuntimeOptions;
 use crate::ExecutorFileSystem;
 use crate::GetMetadataOptions;
 use crate::ReadFileOptions;
@@ -59,7 +59,7 @@ pub(crate) struct FileSystemHandler {
 }
 
 impl FileSystemHandler {
-    pub(crate) fn new(runtime_paths: ExecServerRuntimePaths) -> Self {
+    pub(crate) fn new(runtime_paths: ExecServerRuntimeOptions) -> Self {
         Self {
             file_system: LocalFileSystem::with_runtime_paths(runtime_paths),
             file_reads: FileReadHandleManager::default(),
@@ -79,7 +79,10 @@ impl FileSystemHandler {
             .first()
             .and_then(|root| root.sandbox.as_ref())
             .filter(|sandbox| {
-                sandbox.should_run_in_sandbox()
+                sandbox
+                    .validate_file_system_paths_for_current_host()
+                    .is_ok()
+                    && sandbox.should_read_from_sandbox()
                     && (!cfg!(target_os = "windows") || sandbox.windows_sandbox_is_requested())
                     && params
                         .roots
@@ -366,7 +369,7 @@ mod tests {
     #[tokio::test]
     async fn no_platform_sandbox_policies_do_not_require_configured_sandbox_helper() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        let runtime_paths = ExecServerRuntimePaths::new(
+        let runtime_paths = ExecServerRuntimeOptions::new(
             std::env::current_exe().expect("current exe"),
             /*codex_linux_sandbox_exe*/ None,
         )
