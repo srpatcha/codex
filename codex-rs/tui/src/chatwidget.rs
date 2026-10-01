@@ -336,6 +336,7 @@ mod backend_banners;
 mod compaction;
 mod luna_reserve_model;
 mod luna_reserve_return;
+mod security_setup;
 pub(crate) use backend_banners::AutomaticModelSwitchReason;
 mod protocol;
 mod protocol_requests;
@@ -514,7 +515,7 @@ pub(crate) enum ExternalEditorState {
 pub(crate) struct ChatWidget {
     pub(crate) empty_state_animation:
         std::cell::RefCell<crate::empty_state_animation::EmptyStateAnimation>,
-    pub(crate) cyber_policy_notice: crate::daybreak::NoticeCache,
+    pub(crate) daybreak_enabled: bool,
     app_event_tx: AppEventSender,
     codex_op_target: CodexOpTarget,
     bottom_pane: BottomPane,
@@ -574,6 +575,10 @@ pub(crate) struct ChatWidget {
     clock_format: crate::clock_format::ClockFormat,
     usage_notice_state: usage_notice::UsageNoticeState,
     backend_banner_state: backend_banners::BackendBannerState,
+    pub(crate) security_setup_request_id: uuid::Uuid,
+    security_setup_presented: bool,
+    security_setup_identity: Option<crate::security_setup::Identity>,
+    security_setup_dismissed: bool,
     automatic_model_switch_state: backend_banners::AutomaticModelSwitchState,
     backend_banner_notice_model: Option<String>,
     // Remember the account's Reserve entry notice across chats and transient banner refreshes.

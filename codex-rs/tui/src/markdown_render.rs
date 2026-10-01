@@ -997,8 +997,9 @@ impl<'a, 'policy> Writer<'a, 'policy> {
             let index = self.text.len();
             self.push_blank_line();
             if let Some(line) = self.text.get_mut(index) {
-                let mut source =
-                    crate::terminal_hyperlinks::LogicalLineSource::from_line(&line.line);
+                let mut source = line.source.clone().unwrap_or_else(|| {
+                    crate::terminal_hyperlinks::LogicalLineSource::from_line(&line.line)
+                });
                 let mut copy = crate::markdown_copy::CopyLine::default();
                 copy.omit = true;
                 source.copy = Some(std::sync::Arc::new(copy));
@@ -2210,7 +2211,9 @@ impl<'a, 'policy> Writer<'a, 'policy> {
                         }
                         self.push_span_to_table_cell(" (".into());
                     }
+                    self.copy_inline.push(crate::markdown_copy::Inline::Literal);
                     self.push_span_to_table_cell(span);
+                    self.copy_inline.pop();
                     if show_label {
                         self.push_span_to_table_cell(")".into());
                     }
@@ -2230,7 +2233,9 @@ impl<'a, 'policy> Writer<'a, 'policy> {
                         }
                         self.push_span(" (".into());
                     }
+                    self.copy_inline.push(crate::markdown_copy::Inline::Literal);
                     self.push_span(span);
+                    self.copy_inline.pop();
                     if show_label {
                         self.push_span(")".into());
                     }

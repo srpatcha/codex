@@ -12,6 +12,22 @@ use tokio::net::TcpListener;
 use super::disconnect::serve_reconnect_requests;
 
 #[tokio::test]
+async fn reconnect_restores_launch_reviewer_without_a_profile_override() -> Result<()> {
+    let (mut app, _events, _ops) = make_test_app_with_channels().await;
+    let mut cached = test_thread_session(ThreadId::new(), app.config.cwd.to_path_buf());
+    cached.approvals_reviewer = ApprovalsReviewer::AutoReview;
+    app.primary_thread_id = Some(cached.thread_id);
+    app.config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+    app.harness_overrides.approvals_reviewer = Some(ApprovalsReviewer::AutoReview);
+    app.remember_launch_permissions();
+    let mut resumed = cached.clone();
+    resumed.approvals_reviewer = ApprovalsReviewer::User;
+    app.restore_runtime_permissions(&mut resumed, &cached);
+    assert_eq!(resumed, cached);
+    Ok(())
+}
+
+#[tokio::test]
 async fn reconnect_restores_history_permissions_and_resumes_unsent_input() -> Result<()> {
     for (recovered_queue, edit_offline, resume_error_code, deferred_notice, notice_enabled) in [
         (true, false, -32603, false, false),
@@ -205,7 +221,8 @@ async fn reconnect_restores_history_permissions_and_resumes_unsent_input() -> Re
             );
         let mut tui = crate::tui::test_support::make_test_tui()?;
         if pending_profile {
-            app.pending_server_profiles.insert(
+            app.runtime_approvals_reviewer_override = Some(ApprovalsReviewer::User);
+            app.agents_overview.requested_permission_profiles.insert(
                 id,
                 PermissionProfileSelection {
                     profile_id: "server-only".into(),
@@ -302,6 +319,16 @@ async fn reconnect_restores_history_permissions_and_resumes_unsent_input() -> Re
             );
         }
         assert!(app.pending_server_profiles.is_empty());
+        assert!(app.agents_overview.requested_permission_profiles.is_empty());
+        if pending_profile {
+            assert_eq!(
+                app.resume_permission_overrides(&app.config),
+                crate::resume_permissions::ResumePermissions {
+                    approvals_reviewer: true,
+                    ..Default::default()
+                }
+            );
+        }
         assert!(!app.pending_managed_worktree_creation);
         assert!(
             !app.agents_overview
@@ -518,7 +545,7 @@ async fn reconnect_reconciles_offscreen_pending_profile_before_restoring_permiss
                 "thread/read" => json!({"result": {"thread": thread(primary)}}),
                 "turn/start" => {
                     let params = request.params.as_ref().unwrap();
-                    assert_eq!(params["permissions"], "server-only");
+                    assert_eq!(params["permissions"], serde_json::Value::Null);
                     assert_eq!(params["approvalPolicy"], "on-request");
                     assert_eq!(params["sandboxPolicy"], json!(null));
                     json!({"result": {"turn": {"id": "fresh", "items": [], "status": "inProgress"}}})

@@ -6,6 +6,7 @@ use codex_file_system::FileSystemSandboxContext;
 pub use codex_file_system::WalkOptions;
 pub use codex_file_system::WalkOutcome;
 use codex_file_system::WireFileSystemSandboxContext;
+use codex_install_context::InstallContext;
 use codex_network_proxy::ManagedNetworkSandboxContext;
 use codex_network_proxy::RemoteNetworkProxyLaunchConfig;
 use codex_protocol::ThreadId;
@@ -34,6 +35,7 @@ pub const ENVIRONMENT_STATUS_METHOD: &str = "environment/status";
 pub const FS_READ_FILE_METHOD: &str = "fs/readFile";
 pub const FS_OPEN_METHOD: &str = "fs/open";
 pub const FS_READ_BLOCK_METHOD: &str = "fs/readBlock";
+pub const FS_WRITE_BLOCK_METHOD: &str = "fs/writeBlock";
 pub const FS_CLOSE_METHOD: &str = "fs/close";
 pub const FS_WRITE_FILE_METHOD: &str = "fs/writeFile";
 pub const FS_CREATE_DIRECTORY_METHOD: &str = "fs/createDirectory";
@@ -116,6 +118,9 @@ pub struct EnvironmentInfo {
     /// Operating system reported by the executor; absent for legacy exec-servers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform_os: Option<String>,
+    /// Executor directories to prepend to `PATH` when missing, in priority order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prepend_path_dirs: Vec<PathUri>,
     /// Executor-local default directories for resolving `:tmpdir`, when reported.
     /// On Windows, a command's `TEMP` or `TMP` overrides take precedence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -154,6 +159,9 @@ pub struct EnvironmentCapabilities {
     /// Whether filesystem streams can use the requested platform sandbox.
     #[serde(default)]
     pub sandboxed_file_streaming: bool,
+    /// Whether `fs/open` supports replacement mode and `fs/writeBlock` is supported.
+    #[serde(default)]
+    pub file_write_streaming: bool,
     /// Whether shell state can be cached and restored entirely inside the executor.
     #[serde(default)]
     pub shell_snapshot_v2: bool,
@@ -252,6 +260,13 @@ impl EnvironmentInfo {
             cwd: cwd.and_then(|cwd| PathUri::from_host_native_path(cwd).ok()),
             user_home_dir: PathUri::from_host_native_path("~").ok(),
             platform_os: Some(std::env::consts::OS.to_string()),
+            prepend_path_dirs: InstallContext::current()
+                .package_layout
+                .as_ref()
+                .and_then(|layout| layout.path_dir.as_ref())
+                .into_iter()
+                .map(PathUri::from_abs_path)
+                .collect(),
             temporary_directories: Some(temporary_directories),
             temp_dir,
             capabilities: EnvironmentCapabilities {
@@ -261,6 +276,7 @@ impl EnvironmentInfo {
                 environment_config_read: true,
                 http_header_env_vars: true,
                 sandboxed_file_streaming: true,
+                file_write_streaming: false,
                 shell_snapshot_v2: cfg!(unix),
                 windows_mxc,
                 linux_root_write_preserves_devices: cfg!(target_os = "linux"),
@@ -555,11 +571,24 @@ pub struct FsReadFileResponse {
     pub data_base64: String,
 }
 
+/// Defaults preserve read-only opens for legacy callers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FsOpenMode {
+    /// Open an existing file for reading.
+    #[default]
+    Read,
+    /// Open for writing, creating a missing file or truncating an existing file.
+    Replace,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FsOpenParams {
     pub handle_id: String,
     pub path: PathUri,
+    #[serde(default)]
+    pub mode: FsOpenMode,
     pub sandbox: Option<FileSystemSandboxContext>,
 }
 
@@ -569,6 +598,8 @@ pub struct FsOpenParams {
 pub struct WireFsOpenParams {
     handle_id: String,
     path: PathUri,
+    #[serde(default)]
+    mode: FsOpenMode,
     sandbox: Option<WireFileSystemSandboxContext>,
 }
 
@@ -592,6 +623,20 @@ pub struct FsReadBlockResponse {
     pub chunk: ByteChunk,
     pub eof: bool,
 }
+
+/// Writes a nonempty block of at most [`codex_file_system::FILE_WRITE_CHUNK_SIZE`] decoded bytes at `offset`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FsWriteBlockParams {
+    pub handle_id: String,
+    pub offset: u64,
+    pub chunk: ByteChunk,
+}
+
+/// A successful response confirms that every byte in the requested block was written.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FsWriteBlockResponse {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -863,7 +908,7 @@ macro_rules! impl_wire_filesystem_request {
 
 impl_wire_filesystem_request! {
     WireFsReadFileParams => FsReadFileParams { path, follow_symlinks },
-    WireFsOpenParams => FsOpenParams { handle_id, path },
+    WireFsOpenParams => FsOpenParams { handle_id, path, mode },
     WireFsWriteFileParams => FsWriteFileParams { path, data_base64, follow_symlinks },
     WireFsCreateDirectoryParams => FsCreateDirectoryParams { path, recursive, follow_symlinks },
     WireFsGetMetadataParams => FsGetMetadataParams { path, follow_symlinks },
@@ -1190,6 +1235,7 @@ mod tests {
     use super::ExecMetadata;
     use super::ExecParams;
     use super::ExecResponse;
+    use super::FsOpenMode;
     use super::FsOpenParams;
     use super::FsReadFileParams;
     use super::HttpRequestParams;
@@ -1372,6 +1418,7 @@ mod tests {
                 cwd: None,
                 user_home_dir: None,
                 platform_os: None,
+                prepend_path_dirs: Vec::new(),
                 temporary_directories: None,
                 temp_dir: None,
                 capabilities: EnvironmentCapabilities::default(),
@@ -1396,6 +1443,7 @@ mod tests {
                 environment_config_read: false,
                 http_header_env_vars: false,
                 sandboxed_file_streaming: false,
+                file_write_streaming: false,
                 shell_snapshot_v2: false,
                 windows_mxc: false,
                 linux_root_write_preserves_devices: false,
@@ -1447,6 +1495,7 @@ mod tests {
             "cwd": null,
             "userHomeDir": "file:///C:/Users/remote",
             "platformOs": "windows",
+            "prependPathDirs": ["file:///C:/tools/bin", "file:///D:/tools/bin"],
             "temporaryDirectories": ["file:///C:/Temp", "file:///D:/Temp"],
             "capabilities": {
                 "networkProxyLaunch": false,
@@ -1455,6 +1504,7 @@ mod tests {
                 "environmentConfigRead": false,
                 "httpHeaderEnvVars": false,
                 "sandboxedFileStreaming": false,
+                "fileWriteStreaming": false,
                 "shellSnapshotV2": false,
                 "windowsMxc": false,
             },
@@ -1724,6 +1774,26 @@ mod tests {
         assert_eq!(request, params);
     }
 
+    /// Legacy `fs/open` callers continue to open existing files for reading only.
+    #[test]
+    fn filesystem_open_accepts_legacy_request_without_mode() {
+        let wire: WireFsOpenParams = serde_json::from_value(serde_json::json!({
+            "handleId": "legacy-handle",
+            "path": "file:///tmp/existing.txt",
+        }))
+        .expect("legacy open should deserialize");
+        assert_eq!(
+            wire.try_into_request(|_| panic!("no sandbox to resolve"))
+                .expect("legacy open should resolve"),
+            FsOpenParams {
+                handle_id: "legacy-handle".to_string(),
+                path: PathUri::parse("file:///tmp/existing.txt").expect("file URI"),
+                mode: FsOpenMode::Read,
+                sandbox: None,
+            }
+        );
+    }
+
     /// Only filesystem RPCs need the additive policy field; capability discovery keeps its original wire cwd.
     #[test]
     fn filesystem_open_and_capability_discovery_keep_their_existing_cwd_contracts() {
@@ -1737,6 +1807,7 @@ mod tests {
         let open = FsOpenParams {
             handle_id: "handle".to_owned(),
             path: path.clone(),
+            mode: FsOpenMode::Read,
             sandbox: Some(sandbox.clone()),
         };
         let capability = CapabilityRootDiscoverRequest {

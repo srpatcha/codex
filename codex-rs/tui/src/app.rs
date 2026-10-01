@@ -217,6 +217,7 @@ mod composer_hints;
 mod config_persistence;
 mod connector_mentions;
 mod daemon_menu;
+mod daybreak;
 mod empty_state_policy;
 mod event_dispatch;
 mod exit_summary;
@@ -541,6 +542,7 @@ pub(crate) struct App {
     loader_overrides: LoaderOverrides,
     cloud_config_bundle: CloudConfigBundleLoader,
     runtime_approval_policy_override: Option<RuntimeApprovalPolicyOverride>,
+    runtime_approvals_reviewer_override: Option<ApprovalsReviewer>,
     runtime_permission_profile_override: Option<RuntimePermissionProfileOverride>,
     /// In-flight remote selections; confirmed settings live in each task's server snapshot.
     pending_server_profiles: HashMap<ThreadId, PermissionProfileSelection>,
@@ -654,6 +656,9 @@ pub(crate) struct App {
     /// Invalidates in-flight full rate-limit reads when a newer rolling hard stop arrives.
     rate_limit_hard_stop_generation: u64,
     rate_limit_refresh_state: rate_limit_refresh::RateLimitRefreshState,
+    pending_mcp_login_start: Option<PendingMcpLoginStart>,
+    // Latest accepted attempt per server; stale retry completions must not update the UI.
+    active_mcp_login_ids: HashMap<String, String>,
     // Serialize plugin enablement writes per plugin so stale completions cannot
     // overwrite a newer toggle, even if the plugin is toggled from different
     // cwd contexts.
@@ -667,12 +672,18 @@ pub(crate) struct App {
     _test_codex_home: Option<tempfile::TempDir>,
 }
 
+struct PendingMcpLoginStart {
+    request_id: String,
+    name: String,
+    thread_id: ThreadId,
+    completions: Vec<codex_app_server_protocol::McpServerOauthLoginCompletedNotification>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct RuntimePermissionProfileOverride {
     permission_profile: PermissionProfile,
     active_permission_profile: Option<ActivePermissionProfile>,
     network: Option<crate::legacy_core::config::NetworkProxySpec>,
-    approvals_reviewer: ApprovalsReviewer,
     turn_override: RuntimePermissionProfileTurnOverride,
 }
 
@@ -709,7 +720,6 @@ impl RuntimePermissionProfileOverride {
             permission_profile: config.permissions.permission_profile().clone(),
             active_permission_profile: config.permissions.active_permission_profile(),
             network: config.permissions.network.clone(),
-            approvals_reviewer: config.approvals_reviewer,
             turn_override: RuntimePermissionProfileTurnOverride::LegacySandbox,
         }
     }
@@ -725,7 +735,6 @@ impl RuntimePermissionProfileOverride {
         self.permission_profile == *config.permissions.permission_profile()
             && self.active_permission_profile == config.permissions.active_permission_profile()
             && self.network == config.permissions.network
-            && self.approvals_reviewer == config.approvals_reviewer
     }
 
     fn turn_permission_profile(&self) -> Option<&PermissionProfile> {

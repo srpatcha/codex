@@ -34,6 +34,12 @@ impl SessionTask for CompactTask {
         _cancellation_token: CancellationToken,
     ) -> SessionTaskResult {
         let _profile_guard = ctx.turn_timing_state.begin_compaction();
+        let _compaction_span = tracing::trace_span!(
+            "codex.compaction",
+            codex.turn.phase = "compaction",
+            conversation.id = %session.thread_id,
+            turn.id = %ctx.sub_id,
+        );
         if ctx.config.features.enabled(Feature::TokenBudget) {
             crate::compact_token_budget::run_manual_compact_task(session, ctx).await?;
             return Ok(None);
@@ -75,7 +81,9 @@ impl SessionTask for CompactTask {
             let error = err.to_codex_protocol_error();
             if matches!(error, CodexErrorInfo::UsageLimitExceeded) {
                 // Compaction already emitted the error; notify extensions without emitting it twice.
-                session.emit_turn_error_lifecycle(ctx.as_ref(), error).await;
+                session
+                    .emit_turn_error_lifecycle(ctx.as_ref(), error, err.details())
+                    .await;
             }
         }
         Ok(None)
