@@ -671,6 +671,11 @@ impl Session {
         state.session_configuration.originator.clone()
     }
 
+    pub(crate) async fn dynamic_tools(&self) -> Vec<DynamicToolSpec> {
+        let state = self.state.lock().await;
+        state.session_configuration.dynamic_tools.clone()
+    }
+
     pub(crate) async fn responses_metadata(
         &self,
         step_context: &StepContext,
@@ -1734,6 +1739,7 @@ impl Session {
                 models_manager: Arc::clone(&models_manager),
                 git_root_discovery,
                 tool_approvals: Mutex::new(ApprovalStore::default()),
+                granted_permissions_by_environment_id: Arc::default(),
                 runtime_handle: tokio::runtime::Handle::current(),
                 skills_service,
                 agents_md_manager,
@@ -1836,7 +1842,7 @@ impl Session {
                 .then(|| Mutex::new(Default::default())),
                 active_turn: Mutex::new(None),
                 async_hook_results,
-                input_queue: InputQueue::new(),
+                input_queue: InputQueue::with_controller(thread_id, Arc::clone(&services.agent_control)),
                 services,
                 git_enrichment_policy,
                 fork_persistence,

@@ -2937,10 +2937,6 @@ impl Session {
         let sandbox_context = environment.sandbox_context(/*additional_permissions*/ None);
         let context = sandbox_context.policy_context();
         {
-            let originating_turn_state = {
-                let active = self.active_turn.lock().await;
-                active.as_ref().map(|active| Arc::clone(&active.turn_state))
-            };
             let action = ApprovalAction::RequestPermissions {
                 id: call_id.clone(),
                 environment_id: environment_selection.environment_id.clone(),
@@ -3008,9 +3004,8 @@ impl Session {
                 self.record_granted_request_permissions_for_turn(
                     &response,
                     &environment.selection.environment_id,
-                    originating_turn_state.as_ref(),
-                )
-                .await;
+                    turn_context,
+                );
                 return Some(response);
             }
         }
@@ -3028,6 +3023,7 @@ impl Session {
                             tx_response,
                             requested_permissions: requested_permissions.clone(),
                             environment: environment.clone(),
+                            turn_context: Arc::clone(turn_context),
                         },
                     )
                 }
@@ -3150,16 +3146,14 @@ impl Session {
         call_id: &str,
         response: RequestPermissionsResponse,
     ) {
-        let (entry, originating_turn_state) = {
+        let entry = {
             let mut active = self.active_turn.lock().await;
             match active.as_mut() {
                 Some(at) => {
                     let mut ts = at.turn_state.lock().await;
-                    let entry = ts.remove_pending_request_permissions(call_id);
-                    let originating_turn_state = entry.as_ref().map(|_| Arc::clone(&at.turn_state));
-                    (entry, originating_turn_state)
+                    ts.remove_pending_request_permissions(call_id)
                 }
-                None => (None, None),
+                None => None,
             }
         };
         match entry {
@@ -3175,9 +3169,8 @@ impl Session {
                 self.record_granted_request_permissions_for_turn(
                     &response,
                     &entry.environment.selection.environment_id,
-                    originating_turn_state.as_ref(),
-                )
-                .await;
+                    &entry.turn_context,
+                );
                 entry.tx_response.send(response).ok();
             }
             None => {
@@ -3215,30 +3208,26 @@ impl Session {
         }
     }
 
-    async fn record_granted_request_permissions_for_turn(
+    fn record_granted_request_permissions_for_turn(
         &self,
         response: &RequestPermissionsResponse,
         environment_id: &str,
-        originating_turn_state: Option<&Arc<Mutex<crate::state::TurnState>>>,
+        turn_context: &TurnContext,
     ) {
         if response.permissions.is_empty() {
             return;
         }
         match response.scope {
             PermissionGrantScope::Turn => {
-                if let Some(turn_state) = originating_turn_state {
-                    let mut ts = turn_state.lock().await;
-                    let permissions: AdditionalPermissionProfile =
-                        response.permissions.clone().into();
-                    ts.record_granted_permissions(environment_id, permissions);
-                    if response.strict_auto_review {
-                        ts.enable_strict_auto_review();
-                    }
-                }
+                let permissions: AdditionalPermissionProfile = response.permissions.clone().into();
+                turn_context.record_granted_permissions(
+                    environment_id,
+                    permissions,
+                    response.strict_auto_review,
+                );
             }
             PermissionGrantScope::Session => {
-                let mut state = self.state.lock().await;
-                state.record_granted_permissions(
+                self.services.record_granted_permissions(
                     environment_id,
                     response.permissions.clone().into(),
                 );
@@ -3246,24 +3235,6 @@ impl Session {
         }
     }
 
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "active turn reads must stay consistent with the matching turn state"
-    )]
-    pub(crate) async fn granted_turn_permissions(
-        &self,
-        environment_id: &str,
-    ) -> Option<AdditionalPermissionProfile> {
-        let active = self.active_turn.lock().await;
-        let active = active.as_ref()?;
-        let ts = active.turn_state.lock().await;
-        ts.granted_permissions(environment_id)
-    }
-
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "active turn reads must stay consistent with the matching turn state"
-    )]
     pub(crate) async fn active_turn_context_and_strict_auto_review(
         &self,
     ) -> Option<(
@@ -3277,29 +3248,9 @@ impl Session {
         let task = active.task.as_ref()?;
         let turn_context = Arc::clone(&task.turn_context);
         let settings = turn_context.next_step_settings.load_full();
-        let strict_auto_review = active.turn_state.lock().await.strict_auto_review_enabled();
+        let strict_auto_review = turn_context.strict_auto_review_enabled();
         let environments = self.services.turn_environments.snapshot_now();
         Some((turn_context, settings, environments, strict_auto_review))
-    }
-
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "active turn reads must stay consistent with the matching turn state"
-    )]
-    pub(crate) async fn strict_auto_review_enabled(&self) -> bool {
-        let active = self.active_turn.lock().await;
-        let Some(active) = active.as_ref().filter(|active| active.task.is_some()) else {
-            return false;
-        };
-        active.turn_state.lock().await.strict_auto_review_enabled()
-    }
-
-    pub(crate) async fn granted_session_permissions(
-        &self,
-        environment_id: &str,
-    ) -> Option<AdditionalPermissionProfile> {
-        let state = self.state.lock().await;
-        state.granted_permissions(environment_id)
     }
 
     #[expect(
@@ -3823,24 +3774,6 @@ impl Session {
             extension_data.insert(selected_capability_roots.clone());
             if let Some(discovery) = &executor_capability_discovery {
                 extension_data.insert(discovery.as_ref().clone());
-                if !discovery.sandbox_contexts().is_empty() {
-                    extension_data.insert(discovery.sandbox_contexts().clone());
-                }
-            } else if !turn_context
-                .permission_profile_for_environments(&environments)
-                .file_system_sandbox_policy()
-                .has_full_disk_read_access()
-            {
-                let sandbox_contexts = environments
-                    .turn_environments()
-                    .map(|environment| {
-                        (
-                            environment.selection.environment_id.clone(),
-                            environment.sandbox_context(/*additional_permissions*/ None),
-                        )
-                    })
-                    .collect::<HashMap<_, _>>();
-                extension_data.insert(sandbox_contexts);
             }
             let (mcp, prepared_recommendations) = tokio::join!(
                 // MCP refresh can be large; keep it off the sampling request's stack.
@@ -3852,18 +3785,25 @@ impl Session {
                 )),
                 turn::prepare_tool_recommendations(self.as_ref(), turn_context.as_ref()),
             );
-            let mut selected_plugins = self
+            // A step keeps the plugins from the environments it captured, even if shared MCP
+            // moves on to another environment. Its skill tools and the model use this same copy.
+            let selected_plugins = self
                 .services
-                .thread_extension_data
-                .get::<codex_extension_api::SelectedPluginSnapshot>()
-                .map(|snapshot| snapshot.as_ref().clone())
-                .unwrap_or_default();
-            selected_plugins.plugins.retain(|plugin| {
-                ready_selected_capability_roots
-                    .iter()
-                    .any(|root| plugin.selected_root_id.as_ref() == Some(&root.id))
-            });
-            extension_data.insert(selected_plugins.clone());
+                .mcp_manager
+                .selected_plugins_for_step(
+                    codex_extension_api::McpServerContributionContext::for_step(
+                        turn_context.config.as_ref(),
+                        &self.services.mcp_thread_init,
+                        &self.services.thread_extension_data,
+                        &turn_context.originator,
+                        &ready_selected_capability_roots,
+                        executor_capability_discovery.as_deref(),
+                    )
+                    .with_session_source(&turn_context.session_source),
+                    &turn_context.disabled_plugin_ids,
+                )
+                .await;
+            extension_data.insert(selected_plugins);
             let tool_router = turn::built_tools(
                 self.as_ref(),
                 turn_context.as_ref(),
@@ -3879,7 +3819,7 @@ impl Session {
                 executor_capability_discovery,
                 mcp,
                 tool_router,
-                selected_plugins,
+                extension_data,
             ))
         });
         // Returned warnings must finish delivery even if tools fail or preparation is cancelled.
@@ -3894,9 +3834,8 @@ impl Session {
             executor_capability_discovery,
             mcp,
             tool_router,
-            selected_plugins,
+            extension_data,
         ) = prepared_tools??;
-        turn_context.extension_data.insert(selected_plugins);
         Ok(Arc::new(StepContext {
             preempt: turn_context
                 .config
@@ -3911,6 +3850,7 @@ impl Session {
             environments,
             selected_capability_roots,
             executor_capability_discovery,
+            extension_data,
             mcp,
             tool_router,
             loaded_agents_md,

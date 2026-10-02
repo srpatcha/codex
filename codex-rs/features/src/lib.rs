@@ -213,6 +213,8 @@ pub enum Feature {
     MultiAgentV2,
     /// Keep spawn model choices in append-only context instead of tool descriptions.
     ModelCatalogInContext,
+    /// Inherit client-defined dynamic tools in fresh V2 subagents.
+    MultiAgentV2DynamicTools,
     /// Keep sampling through reasoning and commentary boundaries when agent mail arrives.
     /// Pending mail is delivered at the next normal input boundary instead.
     DeferMailboxPreemption,
@@ -357,6 +359,8 @@ pub enum Feature {
     GuardianConversationHistoryTools,
     /// Enable Guardian V2 automatic approval reviews.
     GuardianV2,
+    /// Run Decisions alongside Guardian V2 for measurement without changing approvals.
+    GuardianV2DecisionsComparison,
     /// Removed compatibility flag for the unused Guardian extension prototype.
     GuardianExt,
     /// Enable persisted thread goals and automatic goal continuation.
@@ -1379,6 +1383,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
+        id: Feature::MultiAgentV2DynamicTools,
+        key: "multi_agent_v2_dynamic_tools",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::DeferMailboxPreemption,
         key: "defer_mailbox_preemption",
         stage: Stage::UnderDevelopment,
@@ -1741,6 +1751,12 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::GuardianV2,
         key: "guardianv2",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::GuardianV2DecisionsComparison,
+        key: "guardianv2_decisions_comparison",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },

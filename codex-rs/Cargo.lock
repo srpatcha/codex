@@ -2219,6 +2219,7 @@ dependencies = [
  "codex-http-client",
  "codex-install-context",
  "codex-uds",
+ "codex-utils-cargo-bin",
  "codex-utils-home-dir",
  "futures",
  "libc",
@@ -2230,7 +2231,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2368,6 +2369,7 @@ dependencies = [
  "codex-sandboxing",
  "codex-shell-escalation",
  "codex-utils-absolute-path",
+ "codex-utils-cargo-bin",
  "codex-utils-home-dir",
  "codex-utils-pty",
  "codex-windows-sandbox",
@@ -2594,7 +2596,7 @@ dependencies = [
  "url",
  "vt100",
  "which 8.0.0",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
  "wiremock",
  "zstd",
 ]
@@ -2610,6 +2612,30 @@ dependencies = [
  "rand 0.9.3",
  "tokio",
  "tracing",
+ "url",
+]
+
+[[package]]
+name = "codex-cloud-client"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "bytes",
+ "codex-http-client",
+ "futures",
+ "http 1.4.0",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "pretty_assertions",
+ "prost",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-rustls",
+ "tonic",
+ "tonic-prost",
+ "tower",
  "url",
 ]
 
@@ -2835,7 +2861,7 @@ dependencies = [
  "tracing",
  "wildmatch",
  "winapi-util",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2941,6 +2967,7 @@ dependencies = [
  "codex-install-context",
  "codex-login",
  "codex-mcp",
+ "codex-mcp-extension",
  "codex-memories-read",
  "codex-model-provider",
  "codex-model-provider-info",
@@ -3029,6 +3056,7 @@ dependencies = [
  "walkdir",
  "which 8.0.0",
  "whoami 1.6.1",
+ "windows-sys 0.61.2",
  "wiremock",
  "zstd",
 ]
@@ -3093,6 +3121,7 @@ dependencies = [
  "codex-skills",
  "codex-tools",
  "codex-utils-absolute-path",
+ "codex-utils-cargo-bin",
  "codex-utils-path",
  "codex-utils-path-uri",
  "codex-utils-plugins",
@@ -3248,7 +3277,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
  "wiremock",
 ]
 
@@ -3475,6 +3504,7 @@ dependencies = [
  "codex-file-system",
  "codex-protocol",
  "codex-utils-absolute-path",
+ "codex-utils-cargo-bin",
  "codex-utils-path-uri",
  "codex-utils-process",
  "codex-utils-pty",
@@ -3699,7 +3729,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
  "zstd",
 ]
 
@@ -3814,6 +3844,7 @@ dependencies = [
  "codex-protocol",
  "codex-secrets",
  "codex-terminal-detection",
+ "codex-utils-cargo-bin",
  "codex-utils-process",
  "codex-utils-template",
  "codex-workload-identity",
@@ -4027,6 +4058,7 @@ dependencies = [
  "codex-protocol",
  "codex-response-debug-context",
  "codex-secrets",
+ "codex-utils-cargo-bin",
  "codex-utils-process",
  "codex-utils-redacted-string",
  "http 1.4.0",
@@ -4146,7 +4178,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4330,6 +4362,7 @@ dependencies = [
  "anyhow",
  "codex-build-info",
  "codex-install-context",
+ "codex-utils-cargo-bin",
  "codex-utils-pty",
  "ctor 0.6.3",
  "futures",
@@ -4416,7 +4449,7 @@ dependencies = [
  "urlencoding",
  "webbrowser",
  "which 8.0.0",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
  "wiremock",
 ]
 
@@ -4476,6 +4509,7 @@ dependencies = [
  "codex-protocol",
  "codex-uds",
  "codex-utils-absolute-path",
+ "codex-utils-cargo-bin",
  "codex-utils-home-dir",
  "codex-utils-path-uri",
  "codex-utils-pty",
@@ -4608,6 +4642,7 @@ dependencies = [
  "tokio",
  "toml 0.9.11+spec-1.1.0",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -4874,7 +4909,7 @@ dependencies = [
  "vt100",
  "webbrowser",
  "which 8.0.0",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
  "winsplit",
  "wiremock",
  "zbus",
@@ -4891,7 +4926,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "uds_windows",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5060,7 +5095,7 @@ dependencies = [
  "dunce",
  "pretty_assertions",
  "tempfile",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5106,6 +5141,7 @@ name = "codex-utils-pty"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "codex-utils-cargo-bin",
  "ctor 0.6.3",
  "filedescriptor",
  "lazy_static",
@@ -5291,6 +5327,7 @@ dependencies = [
  "codex-otel",
  "codex-protocol",
  "codex-utils-absolute-path",
+ "codex-utils-cargo-bin",
  "codex-utils-process",
  "codex-utils-pty",
  "codex-utils-string",
@@ -5306,7 +5343,7 @@ dependencies = [
  "tokio",
  "tracing-appender",
  "windows 0.58.0",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5323,7 +5360,7 @@ dependencies = [
  "tokio",
  "toml 0.9.11+spec-1.1.0",
  "windows 0.58.0",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5355,6 +5392,7 @@ dependencies = [
  "anyhow",
  "codex-git-utils",
  "codex-protocol",
+ "codex-utils-cargo-bin",
  "dunce",
  "pretty_assertions",
  "serde",
